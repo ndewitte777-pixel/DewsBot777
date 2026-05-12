@@ -9,15 +9,16 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
+
+
 # =========================
 # CONFIG
 # =========================
-
-ALPACA_API_KEY = "PKJ3X44PXFSCE6PKMC65QNYERM"
-ALPACA_SECRET_KEY = "5Podu3X7pPXYNy3UVNCoKdSsPpRVSVS7VJ5izRp4mofX"
-
-PUSHOVER_USER = "ukge5ehvpq4hqqk4outq8bkxbo6yv3"
-PUSHOVER_TOKEN = "ayei96ywnhsnbzpyhaz1gr7bfz3oud"
+import os
+ALPACA_API_KEY = os.getenv("PKJ3X44PXFSCE6PKMC65QNYERM")
+ALPACA_SECRET_KEY = os.getenv("5Podu3X7pPXYNy3UVNCoKdSsPpRVSVS7VJ5izRp4mofX")
+PUSHOVER_USER = os.getenv("ukge5ehvpq4hqqk4outq8bkxbo6yv3")
+PUSHOVER_TOKEN = os.getenv("ayei96ywnhsnbzpyhaz1gr7bfz3oud")
 
 SYMBOL = "SPY"
 QTY = 1
@@ -112,7 +113,7 @@ while True:
         now = datetime.now()
 
         # Only trade during market hours
-        if now.hour < 9 or now.hour > 16:
+        if now.weekday() >= 5:
             time.sleep(60)
             continue
 
