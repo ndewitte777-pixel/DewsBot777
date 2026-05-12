@@ -15,8 +15,6 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # CONFIG
 # =========================
 import os
-print("API KEY:", os.getenv("ALPACA_API_KEY"))
-print("SECRET:", os.getenv("ALPACA_SECRET_KEY"))
 ALPACA_API_KEY = os.getenv("PKJ3X44PXFSCE6PKMC65QNYERM")
 ALPACA_SECRET_KEY = os.getenv("5Podu3X7pPXYNy3UVNCoKdSsPpRVSVS7VJ5izRp4mofX")
 PUSHOVER_USER = os.getenv("ukge5ehvpq4hqqk4outq8bkxbo6yv3")
