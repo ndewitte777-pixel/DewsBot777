@@ -14,11 +14,16 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # =========================
 # CONFIG
 # =========================
+ALPACA_API_KEY_ = "PKJ3X44PXFSCE6PKMC65QNYERM"
+ALPACA_SECRET_KEY_ = "5Podu3X7pPXYNy3UVNCoKdSsPpRVSVS7VJ5izRp4mofX"
+
+PUSHOVER_USER_ = "ukge5ehvpq4hqqk4outq8bkxbo6yv3"
+PUSHOVER_TOKEN_ = "ayei96ywnhsnbzpyhaz1gr7bfz3oud"
 import os
-ALPACA_API_KEY = os.getenv("PKJ3X44PXFSCE6PKMC65QNYERM")
-ALPACA_SECRET_KEY = os.getenv("5Podu3X7pPXYNy3UVNCoKdSsPpRVSVS7VJ5izRp4mofX")
-PUSHOVER_USER = os.getenv("ukge5ehvpq4hqqk4outq8bkxbo6yv3")
-PUSHOVER_TOKEN = os.getenv("ayei96ywnhsnbzpyhaz1gr7bfz3oud")
+ALPACA_API_KEY = os.getenv(ALPACA_API_KEY_)
+ALPACA_SECRET_KEY = os.getenv(ALPACA_SECRET_KEY_)
+PUSHOVER_USER = os.getenv(PUSHOVER_USER_)
+PUSHOVER_TOKEN = os.getenv(PUSHOVER_TOKEN_)
 
 SYMBOL = "SPY"
 QTY = 1
