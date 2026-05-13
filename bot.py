@@ -6,31 +6,31 @@ from datetime import datetime
 
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.broker.client import BrokerClient
 
 # =========================
 # CONFIG
 # =========================
 
-ALPACA_API_KEY    = os.environ.get("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_API_KEY     = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-SYMBOL      = "SPY"
-QTY         = 1
-TAKE_PROFIT = 0.005  # +0.5% — realistic for SPY intraday
-STOP_LOSS   = 0.003  # -0.3% — tight stop to limit downside
+QTY            = 1       # shares per trade (raise this when going live)
+TAKE_PROFIT    = 0.005   # +0.5%
+STOP_LOSS      = 0.003   # -0.3%
+MAX_DAY_TRADES = 3       # PDT limit — keep at 3 if account < $25k
+MAX_POSITIONS  = 3       # max simultaneous open positions
+TOP_N_SYMBOLS  = 10      # how many stocks to scan each morning
 
-# No new trades after this time (ET)
+# No new entries after this time ET
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
-
-# PDT rule: max 3 day trades per 5 days if account < $25k
-MAX_DAY_TRADES = 3
 
 ET = pytz.timezone("America/New_York")
 
@@ -41,7 +41,7 @@ ET = pytz.timezone("America/New_York")
 trading_client = TradingClient(
     ALPACA_API_KEY,
     ALPACA_SECRET_KEY,
-    paper=True   # <-- Change to False when going live
+    paper=True  # <-- Change to False when going live
 )
 
 data_client = StockHistoricalDataClient(
@@ -54,7 +54,7 @@ data_client = StockHistoricalDataClient(
 # =========================
 
 def notify(message):
-    print(message)  # always log to Railway console
+    print(message)
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
         print("WARNING: Pushover env vars missing — skipping notification")
         return
@@ -90,18 +90,15 @@ def is_after_no_entry_time():
     return (now.hour > NO_ENTRY_AFTER_HOUR or
            (now.hour == NO_ENTRY_AFTER_HOUR and now.minute >= NO_ENTRY_AFTER_MINUTE))
 
+def is_orb_window_complete():
+    now = datetime.now(ET)
+    return now >= now.replace(hour=9, minute=45, second=0, microsecond=0)
+
 def is_near_market_close():
-    """True within 5 minutes of market close — used to force-exit positions."""
     now = datetime.now(ET)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     diff = (market_close - now).total_seconds()
     return 0 < diff <= 300
-
-def is_orb_window_complete():
-    """Only trade after the first 15 min of market open (9:45 AM ET)."""
-    now = datetime.now(ET)
-    orb_done = now.replace(hour=9, minute=45, second=0, microsecond=0)
-    return now >= orb_done
 
 # =========================
 # PDT CHECK
@@ -116,12 +113,60 @@ def get_day_trade_count():
         return 0
 
 # =========================
+# STOCK SCANNER
+# Picks top stocks by volume each morning
+# =========================
+
+# Fallback watchlist if scanner fails
+FALLBACK_SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "AMD", "META", "AMZN", "GOOGL"]
+
+def scan_top_symbols():
+    """
+    Fetches snapshots for a broad list of liquid stocks and ranks
+    them by today's volume to find the most active movers.
+    """
+    try:
+        candidates = [
+            "SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "AMD",
+            "META", "AMZN", "GOOGL", "NFLX", "BABA", "SOFI", "PLTR",
+            "RIVN", "NIO", "F", "GM", "BAC", "JPM", "XOM", "CVX",
+            "INTC", "MU", "SNAP", "UBER", "LYFT", "COIN", "SQ", "SHOP"
+        ]
+
+        req = StockSnapshotRequest(symbol_or_symbols=candidates)
+        snapshots = data_client.get_stock_snapshot(req)
+
+        # Score each stock: volume * abs(daily % change) = high activity + movement
+        scored = []
+        for sym, snap in snapshots.items():
+            try:
+                volume     = snap.daily_bar.volume if snap.daily_bar else 0
+                prev_close = snap.prev_daily_bar.close if snap.prev_daily_bar else None
+                cur_close  = snap.daily_bar.close if snap.daily_bar else None
+                if prev_close and cur_close and prev_close > 0:
+                    pct_change = abs((cur_close - prev_close) / prev_close)
+                    score = volume * pct_change
+                    scored.append((sym, score))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = [s[0] for s in scored[:TOP_N_SYMBOLS]]
+        print(f"Scanned symbols for today: {top}")
+        notify(f"Today's watchlist: {', '.join(top)}")
+        return top
+
+    except Exception as e:
+        print(f"Scanner failed, using fallback: {e}")
+        return FALLBACK_SYMBOLS[:TOP_N_SYMBOLS]
+
+# =========================
 # GET DATA
 # =========================
 
-def get_data():
+def get_data(symbol):
     request = StockBarsRequest(
-        symbol_or_symbols=[SYMBOL],
+        symbol_or_symbols=[symbol],
         timeframe=TimeFrame.Minute,
         limit=100
     )
@@ -134,28 +179,26 @@ def get_data():
 # =========================
 
 def get_orb_levels(df):
-    """Use only 9:30–9:45 AM ET bars for the true opening range."""
     try:
         df["timestamp_et"] = df["timestamp"].dt.tz_convert(ET)
-        open_time  = df["timestamp_et"].iloc[0].replace(hour=9,  minute=30, second=0, microsecond=0)
-        close_time = df["timestamp_et"].iloc[0].replace(hour=9,  minute=45, second=0, microsecond=0)
-        orb_bars = df[(df["timestamp_et"] >= open_time) & (df["timestamp_et"] < close_time)]
+        now_et     = datetime.now(ET)
+        open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+        close_time = now_et.replace(hour=9,  minute=45, second=0, microsecond=0)
+        orb_bars   = df[(df["timestamp_et"] >= open_time) & (df["timestamp_et"] < close_time)]
         if len(orb_bars) < 5:
             orb_bars = df.iloc[:15]
     except Exception:
         orb_bars = df.iloc[:15]
 
-    high = orb_bars["high"].max()
-    low  = orb_bars["low"].min()
-    return high, low
+    return orb_bars["high"].max(), orb_bars["low"].min()
 
 # =========================
 # ORDER EXECUTION
 # =========================
 
-def place_order(side):
+def place_order(symbol, side):
     order = MarketOrderRequest(
-        symbol=SYMBOL,
+        symbol=symbol,
         qty=QTY,
         side=side,
         time_in_force=TimeInForce.DAY
@@ -164,11 +207,15 @@ def place_order(side):
 
 # =========================
 # STATE
+# positions = {
+#   "AAPL": {"side": "LONG", "entry": 175.00, "trades_today": 1},
+#   ...
+# }
 # =========================
 
-position     = None
-entry_price  = None
-trades_today = 0
+positions    = {}   # currently open positions per symbol
+trades_today = {}   # trade count per symbol today
+watchlist    = []   # today's scanned symbols
 last_date    = None
 
 notify("Bot started and running on Railway")
@@ -182,9 +229,11 @@ while True:
         now_et = datetime.now(ET)
         today  = now_et.date()
 
-        # Reset daily trade counter at start of each new day
+        # Reset daily state at start of new trading day
         if last_date != today:
-            trades_today = 0
+            trades_today = {}
+            positions    = {}
+            watchlist    = []
             last_date    = today
             print(f"New trading day: {today}")
 
@@ -193,86 +242,87 @@ while True:
             time.sleep(60)
             continue
 
-        # Force-exit any open position near close (3:55 PM ET)
-        if is_near_market_close() and position is not None:
-            if position == "LONG":
-                place_order(OrderSide.SELL)
-            elif position == "SHORT":
-                place_order(OrderSide.BUY)
-            notify(f"EOD CLOSE {position} {SYMBOL} — forced exit before market close")
-            position = None
+        # Scan for today's symbols once after ORB window is done
+        if not watchlist and is_orb_window_complete():
+            watchlist = scan_top_symbols()
+
+        if not watchlist:
+            print(f"Waiting for ORB window (9:45 AM ET) — {now_et.strftime('%H:%M ET')}")
             time.sleep(60)
             continue
 
-        df = get_data()
-        current_price = df["close"].iloc[-1]
-        high, low = get_orb_levels(df)
+        # Check total PDT usage
+        pdt_used = get_day_trade_count()
 
-        # =========================
-        # ENTRY LOGIC
-        # =========================
+        # Force-exit all positions near market close
+        if is_near_market_close():
+            for sym, pos in list(positions.items()):
+                try:
+                    side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
+                    place_order(sym, side)
+                    notify(f"EOD CLOSE {pos['side']} {sym} — forced exit before close")
+                    del positions[sym]
+                except Exception as e:
+                    print(f"EOD close failed for {sym}: {e}")
+            time.sleep(60)
+            continue
 
-        if position is None:
+        # Loop through each symbol on watchlist
+        for symbol in watchlist:
+            try:
+                df = get_data(symbol)
+                if df.empty:
+                    continue
 
-            if is_after_no_entry_time():
-                print(f"No new entries after 3:30 PM — {now_et.strftime('%H:%M ET')}")
-                time.sleep(60)
+                current_price = df["close"].iloc[-1]
+                high, low     = get_orb_levels(df)
+
+                # ---- MANAGE OPEN POSITION ----
+                if symbol in positions:
+                    pos    = positions[symbol]
+                    entry  = pos["entry"]
+                    change = ((current_price - entry) / entry
+                              if pos["side"] == "LONG"
+                              else (entry - current_price) / entry)
+
+                    if change >= TAKE_PROFIT:
+                        exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
+                        place_order(symbol, exit_side)
+                        notify(f"EXIT {pos['side']} {symbol} @ ${current_price:.2f} | +{change:.2%} profit")
+                        del positions[symbol]
+
+                    elif change <= -STOP_LOSS:
+                        exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
+                        place_order(symbol, exit_side)
+                        notify(f"STOP {pos['side']} {symbol} @ ${current_price:.2f} | {change:.2%} loss")
+                        del positions[symbol]
+                        # Moderate: allow re-entry later today (position removed, not blocked)
+
+                # ---- LOOK FOR NEW ENTRY ----
+                elif (not is_after_no_entry_time()
+                      and is_orb_window_complete()
+                      and pdt_used < MAX_DAY_TRADES
+                      and len(positions) < MAX_POSITIONS):
+
+                    sym_trades = trades_today.get(symbol, 0)
+
+                    if current_price > high:
+                        place_order(symbol, OrderSide.BUY)
+                        positions[symbol] = {"side": "LONG", "entry": current_price}
+                        trades_today[symbol] = sym_trades + 1
+                        pdt_used += 1
+                        notify(f"BUY {symbol} @ ${current_price:.2f} | ORB high: ${high:.2f} | PDT used: {pdt_used}/3")
+
+                    elif current_price < low:
+                        place_order(symbol, OrderSide.SELL)
+                        positions[symbol] = {"side": "SHORT", "entry": current_price}
+                        trades_today[symbol] = sym_trades + 1
+                        pdt_used += 1
+                        notify(f"SHORT {symbol} @ ${current_price:.2f} | ORB low: ${low:.2f} | PDT used: {pdt_used}/3")
+
+            except Exception as e:
+                print(f"Error processing {symbol}: {e}")
                 continue
-
-            if not is_orb_window_complete():
-                print(f"Waiting for ORB window to complete (9:45 AM) — {now_et.strftime('%H:%M ET')}")
-                time.sleep(60)
-                continue
-
-            pdt_count = get_day_trade_count()
-            if pdt_count >= MAX_DAY_TRADES:
-                print(f"PDT limit reached ({pdt_count}/3) — no new trades today")
-                time.sleep(60)
-                continue
-
-            if current_price > high:
-                place_order(OrderSide.BUY)
-                position    = "LONG"
-                entry_price = current_price
-                trades_today += 1
-                notify(f"BUY {SYMBOL} @ ${current_price:.2f} | ORB high: ${high:.2f} | Trade #{trades_today} today")
-
-            elif current_price < low:
-                place_order(OrderSide.SELL)
-                position    = "SHORT"
-                entry_price = current_price
-                trades_today += 1
-                notify(f"SHORT {SYMBOL} @ ${current_price:.2f} | ORB low: ${low:.2f} | Trade #{trades_today} today")
-
-        # =========================
-        # EXIT LOGIC
-        # =========================
-
-        elif position == "LONG":
-            change = (current_price - entry_price) / entry_price
-
-            if change >= TAKE_PROFIT:
-                place_order(OrderSide.SELL)
-                notify(f"EXIT LONG {SYMBOL} @ ${current_price:.2f} | +{change:.2%} profit")
-                position = None
-
-            elif change <= -STOP_LOSS:
-                place_order(OrderSide.SELL)
-                notify(f"STOP LONG {SYMBOL} @ ${current_price:.2f} | {change:.2%} loss")
-                position = None
-
-        elif position == "SHORT":
-            change = (entry_price - current_price) / entry_price
-
-            if change >= TAKE_PROFIT:
-                place_order(OrderSide.BUY)
-                notify(f"EXIT SHORT {SYMBOL} @ ${current_price:.2f} | +{change:.2%} profit")
-                position = None
-
-            elif change <= -STOP_LOSS:
-                place_order(OrderSide.BUY)
-                notify(f"STOP SHORT {SYMBOL} @ ${current_price:.2f} | {change:.2%} loss")
-                position = None
 
         time.sleep(60)
 
