@@ -8,9 +8,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
-from alpaca.broker.client import BrokerClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =========================
 # CONFIG
@@ -21,18 +20,53 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-QTY            = 1       # shares per trade (raise this when going live)
-TAKE_PROFIT    = 0.005   # +0.5%
-STOP_LOSS      = 0.003   # -0.3%
-MAX_DAY_TRADES = 3       # PDT limit — keep at 3 if account < $25k
-MAX_POSITIONS  = 3       # max simultaneous open positions
-TOP_N_SYMBOLS  = 10      # how many stocks to scan each morning
+QTY            = 1      # shares per trade
+TAKE_PROFIT    = 1.50   # dollar target per trade
+STOP_LOSS      = 1.00   # dollar stop per trade
+MAX_DAY_TRADES = 3      # PDT limit — keep at 3 if account < $25k
+MAX_POSITIONS  = 3      # max simultaneous open positions
+MAX_PRICE      = 300    # skip stocks above this price
+
+# Minimum % moves so stops aren't too tight on expensive stocks
+MIN_TP_PCT = 0.004
+MIN_SL_PCT = 0.002
 
 # No new entries after this time ET
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
 ET = pytz.timezone("America/New_York")
+
+# =========================
+# SECTOR ETFs — used to detect which sectors are hot
+# =========================
+
+SECTOR_ETFS = {
+    "Technology":    "XLK",
+    "Energy":        "XLE",
+    "Financials":    "XLF",
+    "Healthcare":    "XLV",
+    "ConsumerDisc":  "XLY",
+    "Industrials":   "XLI",
+    "Materials":     "XLB",
+    "Utilities":     "XLU",
+    "RealEstate":    "XLRE",
+    "ConsumerStap":  "XLP",
+}
+
+# Stocks mapped to each sector — bot focuses on strongest sectors
+SECTOR_STOCKS = {
+    "Technology":   ["AAPL", "MSFT", "NVDA", "AMD", "INTC", "MU", "PLTR", "SNOW"],
+    "Energy":       ["XOM", "CVX", "OXY", "SLB", "HAL"],
+    "Financials":   ["JPM", "BAC", "GS", "MS", "SOFI", "COIN"],
+    "Healthcare":   ["UNH", "PFE", "MRNA", "ABT", "CVS"],
+    "ConsumerDisc": ["TSLA", "AMZN", "NKE", "F", "GM", "RIVN"],
+    "Industrials":  ["BA", "CAT", "GE", "HON", "UPS"],
+    "Materials":    ["FCX", "NEM", "AA", "CLF"],
+    "Utilities":    ["NEE", "DUK", "SO"],
+    "RealEstate":   ["AMT", "PLD", "SPG"],
+    "ConsumerStap": ["WMT", "PG", "KO", "COST"],
+}
 
 # =========================
 # INIT CLIENTS
@@ -101,77 +135,184 @@ def is_near_market_close():
     return 0 < diff <= 300
 
 # =========================
-# PDT CHECK
+# MARKET REGIME DETECTION
+# Reads SPY trend to decide if we go long, short, or sit out
 # =========================
 
-def get_day_trade_count():
+def get_market_regime():
+    """
+    Analyzes SPY to determine overall market direction.
+    Returns: 'bullish', 'bearish', or 'choppy'
+    """
     try:
-        account = trading_client.get_account()
-        return int(account.daytrade_count)
+        req = StockBarsRequest(
+            symbol_or_symbols=["SPY"],
+            timeframe=TimeFrame.Minute,
+            limit=100
+        )
+        df = data_client.get_stock_bars(req).df.reset_index()
+
+        open_price    = df["open"].iloc[0]
+        current_price = df["close"].iloc[-1]
+        high_of_day   = df["high"].max()
+        low_of_day    = df["low"].min()
+
+        daily_change  = (current_price - open_price) / open_price
+
+        # Check if SPY is making higher highs and higher lows (uptrend)
+        mid           = len(df) // 2
+        first_half_high  = df["high"].iloc[:mid].max()
+        second_half_high = df["high"].iloc[mid:].max()
+        first_half_low   = df["low"].iloc[:mid].min()
+        second_half_low  = df["low"].iloc[mid:].min()
+
+        higher_highs = second_half_high > first_half_high
+        higher_lows  = second_half_low  > first_half_low
+        lower_highs  = second_half_high < first_half_high
+        lower_lows   = second_half_low  < first_half_low
+
+        if daily_change > 0.003 and higher_highs and higher_lows:
+            return "bullish"
+        elif daily_change < -0.003 and lower_highs and lower_lows:
+            return "bearish"
+        else:
+            return "choppy"
+
     except Exception as e:
-        print(f"Could not fetch day trade count: {e}")
-        return 0
+        print(f"Market regime check failed: {e}")
+        return "choppy"
+
+# =========================
+# SECTOR ROTATION SCANNER
+# Finds the top 2 performing sectors and picks stocks from them
+# =========================
+
+def get_top_sectors():
+    """Returns the top 2 sectors by today's performance."""
+    try:
+        etf_list = list(SECTOR_ETFS.values())
+        req      = StockSnapshotRequest(symbol_or_symbols=etf_list)
+        snaps    = data_client.get_stock_snapshot(req)
+
+        scored = []
+        for sector, etf in SECTOR_ETFS.items():
+            snap = snaps.get(etf)
+            if not snap:
+                continue
+            try:
+                prev  = snap.prev_daily_bar.close
+                cur   = snap.daily_bar.close
+                vol   = snap.daily_bar.volume
+                pct   = (cur - prev) / prev
+                scored.append((sector, etf, pct, vol))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[2], reverse=True)
+        top = scored[:2]
+        print(f"Top sectors: {[(s[0], f'{s[2]:.2%}') for s in top]}")
+        return [s[0] for s in top]
+
+    except Exception as e:
+        print(f"Sector scan failed: {e}")
+        return list(SECTOR_STOCKS.keys())[:2]
 
 # =========================
 # STOCK SCANNER
-# Picks top stocks by volume each morning
+# Picks best stocks from the top sectors
 # =========================
 
-# Fallback watchlist if scanner fails
-FALLBACK_SYMBOLS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "AMD", "META", "AMZN", "GOOGL"]
-
-def scan_top_symbols():
+def scan_symbols(regime):
     """
-    Fetches snapshots for a broad list of liquid stocks and ranks
-    them by today's volume to find the most active movers.
+    Finds top stocks from the strongest sectors,
+    filtered by price, volume, relative strength vs SPY,
+    and earnings gap filter.
     """
     try:
-        candidates = [
-            "SPY", "QQQ", "AAPL", "TSLA", "NVDA", "MSFT", "AMD",
-            "META", "AMZN", "GOOGL", "NFLX", "BABA", "SOFI", "PLTR",
-            "RIVN", "NIO", "F", "GM", "BAC", "JPM", "XOM", "CVX",
-            "INTC", "MU", "SNAP", "UBER", "LYFT", "COIN", "SQ", "SHOP"
-        ]
+        # Get SPY's daily change as benchmark
+        spy_req  = StockSnapshotRequest(symbol_or_symbols=["SPY"])
+        spy_snap = data_client.get_stock_snapshot(spy_req).get("SPY")
+        spy_change = 0
+        if spy_snap:
+            spy_change = (spy_snap.daily_bar.close - spy_snap.prev_daily_bar.close) / spy_snap.prev_daily_bar.close
 
-        req = StockSnapshotRequest(symbol_or_symbols=candidates)
-        snapshots = data_client.get_stock_snapshot(req)
+        # Get top sectors and their stocks
+        top_sectors = get_top_sectors()
 
-        # Score each stock: volume * abs(daily % change) = high activity + movement
+        # In bearish regime also include short candidates from weak sectors
+        if regime == "bearish":
+            candidates = []
+            for sector, stocks in SECTOR_STOCKS.items():
+                candidates.extend(stocks)
+        else:
+            candidates = []
+            for sector in top_sectors:
+                candidates.extend(SECTOR_STOCKS.get(sector, []))
+
+        # Remove duplicates
+        candidates = list(set(candidates))
+
+        req   = StockSnapshotRequest(symbol_or_symbols=candidates)
+        snaps = data_client.get_stock_snapshot(req)
+
         scored = []
-        for sym, snap in snapshots.items():
+        for sym, snap in snaps.items():
             try:
-                volume     = snap.daily_bar.volume if snap.daily_bar else 0
-                prev_close = snap.prev_daily_bar.close if snap.prev_daily_bar else None
-                cur_close  = snap.daily_bar.close if snap.daily_bar else None
-                if prev_close and cur_close and prev_close > 0:
-                    pct_change = abs((cur_close - prev_close) / prev_close)
-                    score = volume * pct_change
-                    scored.append((sym, score))
+                prev  = snap.prev_daily_bar.close
+                cur   = snap.daily_bar.close
+                vol   = snap.daily_bar.volume
+                op    = snap.daily_bar.open
+
+                # Price filter — skip expensive stocks
+                if cur > MAX_PRICE:
+                    continue
+
+                # Earnings gap filter — skip stocks that gapped >5% overnight
+                overnight_gap = abs((op - prev) / prev)
+                if overnight_gap > 0.05:
+                    print(f"Skipping {sym} — likely earnings gap ({overnight_gap:.1%})")
+                    continue
+
+                # Relative strength vs SPY
+                stock_change      = (cur - prev) / prev
+                relative_strength = stock_change - spy_change
+
+                # Volume surge check (need historical avg — use today's vol as proxy)
+                score = vol * abs(relative_strength)
+
+                # Boost stocks moving WITH the regime
+                if regime == "bullish" and stock_change > 0:
+                    score *= 1.5
+                elif regime == "bearish" and stock_change < 0:
+                    score *= 1.5
+
+                scored.append((sym, score, cur))
+
             except Exception:
                 continue
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        top = [s[0] for s in scored[:TOP_N_SYMBOLS]]
-        print(f"Scanned symbols for today: {top}")
-        notify(f"Today's watchlist: {', '.join(top)}")
+        top = [s[0] for s in scored[:10]]
+        print(f"Today's watchlist ({regime} market): {top}")
+        notify(f"Market: {regime.upper()} | Watchlist: {', '.join(top)}")
         return top
 
     except Exception as e:
-        print(f"Scanner failed, using fallback: {e}")
-        return FALLBACK_SYMBOLS[:TOP_N_SYMBOLS]
+        print(f"Stock scanner failed: {e}")
+        return ["SPY", "QQQ", "AAPL", "TSLA", "AMD"]
 
 # =========================
-# GET DATA
+# GET BARS
 # =========================
 
 def get_data(symbol):
-    request = StockBarsRequest(
+    req = StockBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=TimeFrame.Minute,
         limit=100
     )
-    bars = data_client.get_stock_bars(request)
-    df = bars.df.reset_index()
+    bars = data_client.get_stock_bars(req)
+    df   = bars.df.reset_index()
     return df
 
 # =========================
@@ -189,8 +330,27 @@ def get_orb_levels(df):
             orb_bars = df.iloc[:15]
     except Exception:
         orb_bars = df.iloc[:15]
-
     return orb_bars["high"].max(), orb_bars["low"].min()
+
+# =========================
+# VOLUME CONFIRMATION
+# Only enter if breakout candle has above-average volume
+# =========================
+
+def has_volume_confirmation(df):
+    avg_vol     = df["volume"].mean()
+    latest_vol  = df["volume"].iloc[-1]
+    return latest_vol > avg_vol * 1.5
+
+# =========================
+# DOLLAR-BASED TP/SL
+# Uses $1.50/$1.00 with a minimum % floor
+# =========================
+
+def get_tp_sl(entry_price):
+    tp = max(TAKE_PROFIT, entry_price * MIN_TP_PCT)
+    sl = max(STOP_LOSS,   entry_price * MIN_SL_PCT)
+    return tp, sl
 
 # =========================
 # ORDER EXECUTION
@@ -206,17 +366,25 @@ def place_order(symbol, side):
     trading_client.submit_order(order)
 
 # =========================
-# STATE
-# positions = {
-#   "AAPL": {"side": "LONG", "entry": 175.00, "trades_today": 1},
-#   ...
-# }
+# PDT CHECK
 # =========================
 
-positions    = {}   # currently open positions per symbol
-trades_today = {}   # trade count per symbol today
-watchlist    = []   # today's scanned symbols
-last_date    = None
+def get_day_trade_count():
+    try:
+        account = trading_client.get_account()
+        return int(account.daytrade_count)
+    except Exception as e:
+        print(f"Could not fetch day trade count: {e}")
+        return 0
+
+# =========================
+# STATE
+# =========================
+
+positions  = {}   # { "AAPL": {"side": "LONG", "entry": 175.00, "tp": 1.50, "sl": 1.00} }
+watchlist  = []
+regime     = "choppy"
+last_date  = None
 
 notify("Bot started and running on Railway")
 
@@ -229,12 +397,12 @@ while True:
         now_et = datetime.now(ET)
         today  = now_et.date()
 
-        # Reset daily state at start of new trading day
+        # Reset daily state
         if last_date != today:
-            trades_today = {}
-            positions    = {}
-            watchlist    = []
-            last_date    = today
+            positions = {}
+            watchlist = []
+            regime    = "choppy"
+            last_date = today
             print(f"New trading day: {today}")
 
         if not is_market_open():
@@ -242,19 +410,32 @@ while True:
             time.sleep(60)
             continue
 
-        # Scan for today's symbols once after ORB window is done
+        # Build watchlist once after ORB window
         if not watchlist and is_orb_window_complete():
-            watchlist = scan_top_symbols()
+            regime    = get_market_regime()
+            watchlist = scan_symbols(regime)
 
         if not watchlist:
             print(f"Waiting for ORB window (9:45 AM ET) — {now_et.strftime('%H:%M ET')}")
             time.sleep(60)
             continue
 
-        # Check total PDT usage
+        # Refresh market regime every 30 minutes
+        if now_et.minute % 30 == 0:
+            new_regime = get_market_regime()
+            if new_regime != regime:
+                notify(f"Market regime changed: {regime.upper()} → {new_regime.upper()}")
+                regime = new_regime
+
+        # Sit out completely if market is choppy and no open positions
+        if regime == "choppy" and len(positions) == 0:
+            print(f"Choppy market — sitting out new entries")
+            time.sleep(60)
+            continue
+
         pdt_used = get_day_trade_count()
 
-        # Force-exit all positions near market close
+        # Force-exit all positions near close
         if is_near_market_close():
             for sym, pos in list(positions.items()):
                 try:
@@ -267,11 +448,11 @@ while True:
             time.sleep(60)
             continue
 
-        # Loop through each symbol on watchlist
+        # Process each symbol
         for symbol in watchlist:
             try:
                 df = get_data(symbol)
-                if df.empty:
+                if df.empty or len(df) < 20:
                     continue
 
                 current_price = df["close"].iloc[-1]
@@ -281,44 +462,46 @@ while True:
                 if symbol in positions:
                     pos    = positions[symbol]
                     entry  = pos["entry"]
-                    change = ((current_price - entry) / entry
-                              if pos["side"] == "LONG"
-                              else (entry - current_price) / entry)
+                    tp     = pos["tp"]
+                    sl     = pos["sl"]
 
-                    if change >= TAKE_PROFIT:
+                    gain = (current_price - entry) if pos["side"] == "LONG" else (entry - current_price)
+
+                    if gain >= tp:
                         exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
                         place_order(symbol, exit_side)
-                        notify(f"EXIT {pos['side']} {symbol} @ ${current_price:.2f} | +{change:.2%} profit")
+                        notify(f"PROFIT {pos['side']} {symbol} @ ${current_price:.2f} | +${gain:.2f}")
                         del positions[symbol]
 
-                    elif change <= -STOP_LOSS:
+                    elif gain <= -sl:
                         exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
                         place_order(symbol, exit_side)
-                        notify(f"STOP {pos['side']} {symbol} @ ${current_price:.2f} | {change:.2%} loss")
+                        notify(f"STOP {pos['side']} {symbol} @ ${current_price:.2f} | -${abs(gain):.2f}")
                         del positions[symbol]
-                        # Moderate: allow re-entry later today (position removed, not blocked)
+                        # Moderate: position removed so re-entry is allowed later today
 
                 # ---- LOOK FOR NEW ENTRY ----
                 elif (not is_after_no_entry_time()
                       and is_orb_window_complete()
                       and pdt_used < MAX_DAY_TRADES
-                      and len(positions) < MAX_POSITIONS):
+                      and len(positions) < MAX_POSITIONS
+                      and has_volume_confirmation(df)):
 
-                    sym_trades = trades_today.get(symbol, 0)
+                    tp_amt, sl_amt = get_tp_sl(current_price)
 
-                    if current_price > high:
+                    # Bullish regime — only longs
+                    if regime == "bullish" and current_price > high:
                         place_order(symbol, OrderSide.BUY)
-                        positions[symbol] = {"side": "LONG", "entry": current_price}
-                        trades_today[symbol] = sym_trades + 1
+                        positions[symbol] = {"side": "LONG", "entry": current_price, "tp": tp_amt, "sl": sl_amt}
                         pdt_used += 1
-                        notify(f"BUY {symbol} @ ${current_price:.2f} | ORB high: ${high:.2f} | PDT used: {pdt_used}/3")
+                        notify(f"BUY {symbol} @ ${current_price:.2f} | TP: +${tp_amt:.2f} SL: -${sl_amt:.2f} | PDT: {pdt_used}/3")
 
-                    elif current_price < low:
+                    # Bearish regime — only shorts
+                    elif regime == "bearish" and current_price < low:
                         place_order(symbol, OrderSide.SELL)
-                        positions[symbol] = {"side": "SHORT", "entry": current_price}
-                        trades_today[symbol] = sym_trades + 1
+                        positions[symbol] = {"side": "SHORT", "entry": current_price, "tp": tp_amt, "sl": sl_amt}
                         pdt_used += 1
-                        notify(f"SHORT {symbol} @ ${current_price:.2f} | ORB low: ${low:.2f} | PDT used: {pdt_used}/3")
+                        notify(f"SHORT {symbol} @ ${current_price:.2f} | TP: +${tp_amt:.2f} SL: -${sl_amt:.2f} | PDT: {pdt_used}/3")
 
             except Exception as e:
                 print(f"Error processing {symbol}: {e}")
