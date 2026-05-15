@@ -9,7 +9,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, GetPortfolioHistoryRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # =========================
@@ -21,31 +21,38 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-TAKE_PROFIT     = 1.50   # dollar target per trade
-STOP_LOSS       = 1.00   # dollar stop per trade
-MAX_WEEKLY_LOSS = 6.00   # circuit breaker — stops trading if weekly loss hits this
-MAX_DAY_TRADES  = 3      # PDT limit
-MAX_POSITIONS   = 1      # one position at a time for clean tracking
-MIN_PRICE       = 10     # skip stocks below this
-MAX_PRICE       = 100    # skip stocks above this
+TAKE_PROFIT      = 2.00   # $2.00 target — 2× the stop loss
+STOP_LOSS        = 1.00   # $1.00 stop — 2:1 reward/risk ratio
+MAX_WEEKLY_LOSS  = 6.00   # circuit breaker
+MAX_POSITIONS    = 1      # one position at a time
+MIN_PRICE        = 10
+MAX_PRICE        = 100
+BASE_QTY         = 2
+QTY_PER_50       = 1      # add 1 share per $50 growth (was per $100)
+MIN_TP_PCT       = 0.004
+MIN_SL_PCT       = 0.002
 
-# QTY scaling — auto calculated from account balance
-BASE_QTY        = 2      # starting QTY
-QTY_PER_100     = 1      # add 1 share per $100 account growth above $250
+# Loosened entry filters
+REGIME_THRESHOLD  = 0.001
+VOLUME_MULTIPLIER = 1.2
+ORB_BUFFER        = 0.001
 
-# Minimum % floors so stops aren't too tight on higher priced stocks
-MIN_TP_PCT      = 0.004
-MIN_SL_PCT      = 0.002
+# Cash account mode — no PDT limit but trades need settled funds
+# Set CASH_ACCOUNT=true in Railway variables when you switch account type
+CASH_ACCOUNT = os.environ.get("CASH_ACCOUNT", "false").lower() == "true"
 
-# No new entries after this time ET
+# PDT limit — ignored in cash account mode
+MAX_DAY_TRADES = 999 if CASH_ACCOUNT else 3
+
+# Settlement tracking — cash accounts take 2 days to settle
+SETTLEMENT_DAYS = 2
+
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
-# Paper trading start date — used for go-live recommendation
 PAPER_START_DATE = os.environ.get("PAPER_START_DATE", "2026-05-13")
-
-# Trade log file
-LOG_FILE = "trade_log.csv"
+LOG_FILE         = "trade_log.csv"
+SETTLEMENT_FILE  = "settlement_log.csv"
 
 ET = pytz.timezone("America/New_York")
 
@@ -95,160 +102,13 @@ data_client = StockHistoricalDataClient(
 )
 
 # =========================
-# TRADE LOGGER
-# =========================
-
-def init_log():
-    """Create CSV log file with headers if it doesn't exist."""
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "date", "symbol", "side", "entry_price",
-                "exit_price", "qty", "pnl", "result", "regime"
-            ])
-
-def log_trade(symbol, side, entry_price, exit_price, qty, regime):
-    """Log a completed trade to CSV."""
-    pnl    = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
-    result = "WIN" if pnl > 0 else "LOSS"
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
-            symbol, side,
-            round(entry_price, 2), round(exit_price, 2),
-            qty, round(pnl, 2), result, regime
-        ])
-    return pnl, result
-
-def read_all_trades():
-    """Returns all trades from the log as a list of dicts."""
-    trades = []
-    if not os.path.exists(LOG_FILE):
-        return trades
-    with open(LOG_FILE, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            trades.append(row)
-    return trades
-
-def get_week_trades(trades):
-    """Filter trades to current ISO week."""
-    now   = datetime.now(ET)
-    week  = now.isocalendar()[1]
-    year  = now.year
-    return [t for t in trades if _trade_week(t) == (year, week)]
-
-def _trade_week(trade):
-    try:
-        dt   = datetime.strptime(trade["date"], "%Y-%m-%d %H:%M")
-        iso  = dt.isocalendar()
-        return (dt.year, iso[1])
-    except Exception:
-        return (0, 0)
-
-# =========================
-# WIN RATE + STATS
-# =========================
-
-def calc_stats(trades):
-    if not trades:
-        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0,
-                "total_pnl": 0, "avg_win": 0, "avg_loss": 0, "profit_factor": 0}
-
-    wins   = [t for t in trades if t["result"] == "WIN"]
-    losses = [t for t in trades if t["result"] == "LOSS"]
-
-    total_pnl  = sum(float(t["pnl"]) for t in trades)
-    avg_win    = sum(float(t["pnl"]) for t in wins)   / len(wins)   if wins   else 0
-    avg_loss   = sum(float(t["pnl"]) for t in losses) / len(losses) if losses else 0
-    pf         = abs(avg_win / avg_loss) if avg_loss != 0 else 0
-    win_rate   = len(wins) / len(trades) * 100
-
-    return {
-        "total":         len(trades),
-        "wins":          len(wins),
-        "losses":        len(losses),
-        "win_rate":      round(win_rate, 1),
-        "total_pnl":     round(total_pnl, 2),
-        "avg_win":       round(avg_win, 2),
-        "avg_loss":      round(avg_loss, 2),
-        "profit_factor": round(pf, 2)
-    }
-
-# =========================
-# GO-LIVE RECOMMENDATION
-# =========================
-
-def check_go_live_recommendation():
-    """
-    After 4 weeks of paper trading, sends a Pushover recommendation
-    on whether stats are good enough to go live.
-    """
-    try:
-        start  = datetime.strptime(PAPER_START_DATE, "%Y-%m-%d").replace(tzinfo=ET)
-        now    = datetime.now(ET)
-        weeks  = (now - start).days / 7
-
-        if weeks < 4:
-            return  # not enough data yet
-
-        trades = read_all_trades()
-        if len(trades) < 8:
-            return  # need at least 8 trades to evaluate
-
-        stats = calc_stats(trades)
-
-        if stats["win_rate"] >= 55 and stats["profit_factor"] >= 1.3:
-            rec = "✅ RECOMMEND GOING LIVE — win rate and profit factor look solid."
-        elif stats["win_rate"] >= 50 and stats["profit_factor"] >= 1.0:
-            rec = "⚠️ BORDERLINE — consider 2 more weeks of paper trading."
-        else:
-            rec = "❌ NOT READY — win rate too low. Keep paper trading and review strategy."
-
-        notify(
-            f"4-WEEK PAPER REVIEW\n"
-            f"Trades: {stats['total']} | Win rate: {stats['win_rate']}%\n"
-            f"P&L: ${stats['total_pnl']} | Profit factor: {stats['profit_factor']}\n"
-            f"{rec}"
-        )
-    except Exception as e:
-        print(f"Go-live check failed: {e}")
-
-# =========================
-# DYNAMIC QTY
-# Reads real account balance and scales QTY automatically
-# =========================
-
-def get_dynamic_qty():
-    """
-    Scales QTY based on account equity.
-    Adds 1 share per $100 above the $250 base.
-    Never risks more than 40% of account on one trade.
-    """
-    try:
-        account  = trading_client.get_account()
-        equity   = float(account.equity)
-        growth   = max(0, equity - 250)
-        qty      = BASE_QTY + int(growth / 100) * QTY_PER_100
-        # Safety cap — never use more than 40% of account on one trade
-        max_affordable = int((equity * 0.40) / MAX_PRICE)
-        qty = max(1, min(qty, max_affordable))
-        print(f"Account equity: ${equity:.2f} | QTY: {qty}")
-        return qty, equity
-    except Exception as e:
-        print(f"Could not get account equity: {e}")
-        return BASE_QTY, 250.0
-
-# =========================
 # NOTIFICATIONS
 # =========================
 
 def notify(message):
     print(message)
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
-        print("WARNING: Pushover env vars missing — skipping notification")
+        print("WARNING: Pushover env vars missing")
         return
     try:
         resp = requests.post(
@@ -266,22 +126,226 @@ def notify(message):
         print(f"Notification failed: {e}")
 
 # =========================
+# TRADE LOGGER
+# =========================
+
+def init_log():
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "date", "symbol", "side", "entry_price",
+                "exit_price", "qty", "pnl", "result", "regime"
+            ])
+    if not os.path.exists(SETTLEMENT_FILE):
+        with open(SETTLEMENT_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "symbol", "proceeds", "settles_on"])
+
+def log_trade(symbol, side, entry_price, exit_price, qty, regime):
+    pnl    = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
+    result = "WIN" if pnl > 0 else "LOSS"
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+            symbol, side,
+            round(entry_price, 2), round(exit_price, 2),
+            qty, round(pnl, 2), result, regime
+        ])
+    return pnl, result
+
+def read_all_trades():
+    trades = []
+    if not os.path.exists(LOG_FILE):
+        return trades
+    with open(LOG_FILE, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            trades.append(row)
+    return trades
+
+def get_week_trades(trades):
+    now  = datetime.now(ET)
+    week = now.isocalendar()[1]
+    year = now.year
+    return [t for t in trades if _trade_week(t) == (year, week)]
+
+def _trade_week(trade):
+    try:
+        dt  = datetime.strptime(trade["date"], "%Y-%m-%d %H:%M")
+        iso = dt.isocalendar()
+        return (dt.year, iso[1])
+    except Exception:
+        return (0, 0)
+
+# =========================
+# CASH ACCOUNT SETTLEMENT
+# Tracks funds that are pending settlement (T+2)
+# Prevents trading with unsettled funds
+# =========================
+
+def log_settlement(symbol, proceeds, trade_date):
+    """Log sale proceeds with their settlement date (T+2 business days)."""
+    settle_date = get_settlement_date(trade_date)
+    with open(SETTLEMENT_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            trade_date.strftime("%Y-%m-%d"),
+            symbol,
+            round(proceeds, 2),
+            settle_date.strftime("%Y-%m-%d")
+        ])
+
+def get_settlement_date(trade_date):
+    """Returns the date funds settle — T+2 business days, skipping weekends."""
+    settle = trade_date
+    days_added = 0
+    while days_added < SETTLEMENT_DAYS:
+        settle = settle + timedelta(days=1)
+        if settle.weekday() < 5:  # skip weekends
+            days_added += 1
+    return settle
+
+def get_settled_cash():
+    """
+    Returns how much cash is available to trade today.
+    In cash account mode, only settled funds can be used.
+    In margin/PDT mode, full buying power is available.
+    """
+    if not CASH_ACCOUNT:
+        try:
+            account = trading_client.get_account()
+            return float(account.buying_power)
+        except Exception:
+            return 250.0
+
+    # Cash account — check settled funds
+    try:
+        account        = trading_client.get_account()
+        total_cash     = float(account.cash)
+        today          = datetime.now(ET).date()
+        unsettled      = 0.0
+
+        if os.path.exists(SETTLEMENT_FILE):
+            with open(SETTLEMENT_FILE, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    settle_date = datetime.strptime(row["settles_on"], "%Y-%m-%d").date()
+                    if settle_date > today:
+                        unsettled += float(row["proceeds"])
+
+        settled = max(0, total_cash - unsettled)
+        print(f"Cash account — Total: ${total_cash:.2f} | Unsettled: ${unsettled:.2f} | Available: ${settled:.2f}")
+        return settled
+
+    except Exception as e:
+        print(f"Settlement check failed: {e}")
+        return 0.0
+
+def can_afford_trade(price, qty):
+    """Check if we have enough settled cash to place this trade."""
+    cost           = price * qty
+    available_cash = get_settled_cash()
+    if available_cash < cost:
+        print(f"Insufficient settled funds — need ${cost:.2f}, have ${available_cash:.2f}")
+        return False
+    return True
+
+# =========================
+# STATS
+# =========================
+
+def calc_stats(trades):
+    if not trades:
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0,
+                "total_pnl": 0, "avg_win": 0, "avg_loss": 0, "profit_factor": 0}
+    wins      = [t for t in trades if t["result"] == "WIN"]
+    losses    = [t for t in trades if t["result"] == "LOSS"]
+    total_pnl = sum(float(t["pnl"]) for t in trades)
+    avg_win   = sum(float(t["pnl"]) for t in wins)   / len(wins)   if wins   else 0
+    avg_loss  = sum(float(t["pnl"]) for t in losses) / len(losses) if losses else 0
+    pf        = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+    return {
+        "total":         len(trades),
+        "wins":          len(wins),
+        "losses":        len(losses),
+        "win_rate":      round(len(wins) / len(trades) * 100, 1),
+        "total_pnl":     round(total_pnl, 2),
+        "avg_win":       round(avg_win, 2),
+        "avg_loss":      round(avg_loss, 2),
+        "profit_factor": round(pf, 2)
+    }
+
+# =========================
+# GO-LIVE RECOMMENDATION
+# =========================
+
+def check_go_live_recommendation():
+    try:
+        start = datetime.strptime(PAPER_START_DATE, "%Y-%m-%d").replace(tzinfo=ET)
+        weeks = (datetime.now(ET) - start).days / 7
+        if weeks < 4:
+            return
+        trades = read_all_trades()
+        if len(trades) < 8:
+            return
+        stats = calc_stats(trades)
+        if stats["win_rate"] >= 55 and stats["profit_factor"] >= 1.3:
+            rec = "✅ RECOMMEND GOING LIVE"
+        elif stats["win_rate"] >= 50 and stats["profit_factor"] >= 1.0:
+            rec = "⚠️ BORDERLINE — 2 more weeks recommended"
+        else:
+            rec = "❌ NOT READY — keep paper trading"
+        notify(
+            f"4-WEEK PAPER REVIEW\n"
+            f"Trades: {stats['total']} | Win rate: {stats['win_rate']}%\n"
+            f"P&L: ${stats['total_pnl']} | Profit factor: {stats['profit_factor']}\n"
+            f"{rec}"
+        )
+    except Exception as e:
+        print(f"Go-live check failed: {e}")
+
+# =========================
+# DYNAMIC QTY
+# Scales 1 share per $50 growth (faster than before)
+# =========================
+
+def get_dynamic_qty():
+    try:
+        account  = trading_client.get_account()
+        equity   = float(account.equity)
+        growth   = max(0, equity - 250)
+        qty      = BASE_QTY + int(growth / 50) * QTY_PER_50   # every $50 now
+        max_safe = int((equity * 0.40) / MAX_PRICE)
+        qty      = max(1, min(qty, max_safe))
+        mode     = "CASH" if CASH_ACCOUNT else "MARGIN/PDT"
+        print(f"Equity: ${equity:.2f} | QTY: {qty} | Mode: {mode}")
+        return qty, equity
+    except Exception as e:
+        print(f"Could not get account equity: {e}")
+        return BASE_QTY, 250.0
+
+# =========================
 # WEEKLY REPORT
-# Sent every Monday at 9 AM ET
 # =========================
 
 def send_weekly_report(all_trades, equity, qty):
-    """Sends a full weekly summary to Pushover."""
-    week_trades  = get_week_trades(all_trades)
-    all_stats    = calc_stats(all_trades)
-    week_stats   = calc_stats(week_trades)
-
-    # Weeks since paper start
+    week_trades = get_week_trades(all_trades)
+    all_stats   = calc_stats(all_trades)
+    week_stats  = calc_stats(week_trades)
     try:
-        start = datetime.strptime(PAPER_START_DATE, "%Y-%m-%d").replace(tzinfo=ET)
+        start         = datetime.strptime(PAPER_START_DATE, "%Y-%m-%d").replace(tzinfo=ET)
         weeks_running = max(1, int((datetime.now(ET) - start).days / 7))
     except Exception:
         weeks_running = 1
+
+    # Project account value in 24 months at current win rate
+    if all_stats["win_rate"] >= 50:
+        projected = equity * (1.05 ** 24)  # rough monthly compounding estimate
+        projection_str = f"24mo projection: ~${projected:,.0f}"
+    else:
+        projection_str = "Win rate below 50% — review strategy"
 
     if all_stats["win_rate"] >= 60:
         trend = "🔥 Strong"
@@ -290,12 +354,14 @@ def send_weekly_report(all_trades, equity, qty):
     else:
         trend = "⚠️ Below target"
 
-    report = (
-        f"📊 WEEKLY REPORT\n"
-        f"Week {weeks_running} | Account: ${equity:.2f}\n"
+    max_weekly = week_stats['total'] if not CASH_ACCOUNT else 15
+    notify(
+        f"📊 WEEKLY REPORT — Week {weeks_running}\n"
+        f"Account: ${equity:.2f} | QTY: {qty}\n"
+        f"Mode: {'CASH (no PDT)' if CASH_ACCOUNT else 'MARGIN (3/week)'}\n"
         f"─────────────────\n"
         f"THIS WEEK\n"
-        f"Trades: {week_stats['total']}/3 | W: {week_stats['wins']} L: {week_stats['losses']}\n"
+        f"Trades: {week_stats['total']} | W: {week_stats['wins']} L: {week_stats['losses']}\n"
         f"P&L: ${week_stats['total_pnl']}\n"
         f"─────────────────\n"
         f"ALL TIME\n"
@@ -303,10 +369,9 @@ def send_weekly_report(all_trades, equity, qty):
         f"Total P&L: ${all_stats['total_pnl']}\n"
         f"Avg win: ${all_stats['avg_win']} | Avg loss: ${all_stats['avg_loss']}\n"
         f"Profit factor: {all_stats['profit_factor']}\n"
-        f"Current QTY: {qty}\n"
-        f"Status: {trend}"
+        f"Status: {trend}\n"
+        f"{projection_str}"
     )
-    notify(report)
 
 # =========================
 # MARKET HOURS
@@ -359,15 +424,14 @@ def get_market_regime():
         higher_lows   = df["low"].iloc[mid:].min()  > df["low"].iloc[:mid].min()
         lower_highs   = df["high"].iloc[mid:].max() < df["high"].iloc[:mid].max()
         lower_lows    = df["low"].iloc[mid:].min()  < df["low"].iloc[:mid].min()
-
-        if daily_change > 0.003 and higher_highs and higher_lows:
+        if daily_change > REGIME_THRESHOLD and (higher_highs or higher_lows):
             return "bullish"
-        elif daily_change < -0.003 and lower_highs and lower_lows:
+        elif daily_change < -REGIME_THRESHOLD and (lower_highs or lower_lows):
             return "bearish"
         else:
             return "choppy"
     except Exception as e:
-        print(f"Market regime check failed: {e}")
+        print(f"Regime check failed: {e}")
         return "choppy"
 
 # =========================
@@ -421,27 +485,21 @@ def scan_symbols(regime):
         scored = []
         for sym, snap in snaps.items():
             try:
-                prev  = snap.prev_daily_bar.close
-                cur   = snap.daily_bar.close
-                vol   = snap.daily_bar.volume
-                op    = snap.daily_bar.open
-
+                prev = snap.prev_daily_bar.close
+                cur  = snap.daily_bar.close
+                vol  = snap.daily_bar.volume
+                op   = snap.daily_bar.open
                 if cur < MIN_PRICE or cur > MAX_PRICE:
                     continue
-
-                # Earnings gap filter
                 if abs((op - prev) / prev) > 0.05:
                     print(f"Skipping {sym} — earnings gap")
                     continue
-
                 rel_strength = ((cur - prev) / prev) - spy_change
                 score        = vol * abs(rel_strength)
-
-                if regime == "bullish" and cur > prev:
+                if regime in ["bullish", "choppy"] and cur > prev:
                     score *= 1.5
                 elif regime == "bearish" and cur < prev:
                     score *= 1.5
-
                 scored.append((sym, score))
             except Exception:
                 continue
@@ -451,7 +509,6 @@ def scan_symbols(regime):
         print(f"Watchlist ({regime}): {top}")
         notify(f"Market: {regime.upper()} | Scanning: {', '.join(top)}")
         return top
-
     except Exception as e:
         print(f"Scanner failed: {e}")
         return ["AMD", "SOFI", "F", "PLTR", "BAC"]
@@ -492,9 +549,7 @@ def get_orb_levels(df):
 # =========================
 
 def has_volume_confirmation(df):
-    avg_vol    = df["volume"].mean()
-    latest_vol = df["volume"].iloc[-1]
-    return latest_vol > avg_vol * 1.5
+    return df["volume"].iloc[-1] > df["volume"].mean() * VOLUME_MULTIPLIER
 
 # =========================
 # DYNAMIC TP/SL
@@ -510,6 +565,8 @@ def get_tp_sl(entry_price, qty):
 # =========================
 
 def get_day_trade_count():
+    if CASH_ACCOUNT:
+        return 0  # no PDT limit on cash accounts
     try:
         account = trading_client.get_account()
         return int(account.daytrade_count)
@@ -532,29 +589,24 @@ def place_order(symbol, side, qty):
 
 # =========================
 # TRADE TARGETING
-# Ensures exactly 3 trades are spread across the week
-# Mon/Tue/Wed = 1 trade each day
-# If a day is missed, catches up Thu/Fri
+# Cash account = 3 trades/day (15/week)
+# PDT account  = 3 trades/week with Friday catch-up
 # =========================
 
-def get_trades_target_today(week_trade_count):
-    """
-    Returns how many trades we should have taken by end of today.
-    Spreads 3 trades across Mon–Fri evenly, catching up if behind.
-    """
-    now        = datetime.now(ET)
-    weekday    = now.weekday()  # Mon=0, Fri=4
-    days_done  = weekday + 1   # days elapsed including today
-    days_left  = 5 - days_done
+def get_trades_allowed_today(week_trade_count, trades_today):
+    if CASH_ACCOUNT:
+        # Cash account — up to 3 trades per day, no weekly cap
+        return max(0, 3 - trades_today)
 
-    trades_left   = MAX_DAY_TRADES - week_trade_count
-    target_today  = 1 if (weekday < 3 and week_trade_count < MAX_DAY_TRADES) else 0
-
-    # If behind, allow catch-up
-    if week_trade_count < weekday and trades_left > 0 and days_left > 0:
-        target_today = min(trades_left, 2)
-
-    return target_today
+    # PDT account — 3 per week with Friday catch-up
+    now         = datetime.now(ET)
+    weekday     = now.weekday()
+    trades_left = MAX_DAY_TRADES - week_trade_count
+    if trades_left <= 0:
+        return 0
+    if weekday >= 3:  # Thu/Fri — use all remaining
+        return trades_left
+    return min(trades_left, max(1, trades_left - (4 - weekday)))
 
 # =========================
 # STATE
@@ -569,11 +621,13 @@ last_date        = None
 last_week        = None
 weekly_pnl       = 0.0
 week_trade_count = 0
+trades_today     = 0
 report_sent      = False
 qty              = BASE_QTY
 equity           = 250.0
 
-notify("Bot started and running on Railway")
+mode_str = "CASH ACCOUNT (no PDT)" if CASH_ACCOUNT else "MARGIN ACCOUNT (PDT: 3/week)"
+notify(f"Bot started — {mode_str}\nTP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | Ratio: 2:1")
 
 # =========================
 # MAIN LOOP
@@ -581,8 +635,8 @@ notify("Bot started and running on Railway")
 
 while True:
     try:
-        now_et  = datetime.now(ET)
-        today   = now_et.date()
+        now_et   = datetime.now(ET)
+        today    = now_et.date()
         cur_week = now_et.isocalendar()[1]
 
         # ── NEW WEEK RESET ──
@@ -591,16 +645,23 @@ while True:
             week_trade_count = 0
             report_sent      = False
             last_week        = cur_week
-            print(f"New week starting — P&L and trade count reset")
+            print(f"New week — reset")
 
         # ── NEW DAY RESET ──
         if last_date != today:
-            positions  = {}
-            watchlist  = []
-            regime     = "choppy"
-            last_date  = today
-            qty, equity = get_dynamic_qty()
-            print(f"New trading day: {today} | QTY: {qty} | Equity: ${equity:.2f}")
+            positions    = {}
+            watchlist    = []
+            regime       = "choppy"
+            trades_today = 0
+            last_date    = today
+            qty, equity  = get_dynamic_qty()
+            allowed      = get_trades_allowed_today(week_trade_count, 0)
+            print(f"New day: {today} | QTY: {qty} | Equity: ${equity:.2f}")
+            notify(
+                f"New day: {today}\n"
+                f"QTY: {qty} | Equity: ${equity:.2f}\n"
+                f"Trades today: {allowed} | Week: {week_trade_count}/{'∞' if CASH_ACCOUNT else '3'}"
+            )
             check_go_live_recommendation()
 
         # ── WEEKLY REPORT — Monday 9 AM ──
@@ -614,13 +675,13 @@ while True:
             time.sleep(60)
             continue
 
-        # ── BUILD WATCHLIST after ORB window ──
+        # ── BUILD WATCHLIST ──
         if not watchlist and is_orb_window_complete():
             regime    = get_market_regime()
             watchlist = scan_symbols(regime)
 
         if not watchlist:
-            print(f"Waiting for ORB window (9:45 AM ET) — {now_et.strftime('%H:%M ET')}")
+            print(f"Waiting for ORB — {now_et.strftime('%H:%M ET')}")
             time.sleep(60)
             continue
 
@@ -628,36 +689,38 @@ while True:
         if now_et.minute % 30 == 0:
             new_regime = get_market_regime()
             if new_regime != regime:
-                notify(f"Regime changed: {regime.upper()} → {new_regime.upper()}")
+                notify(f"Regime: {regime.upper()} → {new_regime.upper()}")
                 regime = new_regime
 
         # ── WEEKLY CIRCUIT BREAKER ──
         if weekly_pnl <= -MAX_WEEKLY_LOSS:
-            print(f"Weekly loss limit hit (${weekly_pnl:.2f}) — sitting out rest of week")
+            print(f"Weekly loss limit hit — sitting out")
             time.sleep(60)
             continue
 
-        # ── CHOPPY = SIT OUT ──
-        if regime == "choppy" and len(positions) == 0:
-            print(f"Choppy market — no new entries")
-            time.sleep(60)
-            continue
-
-        # ── HOW MANY TRADES SHOULD WE HAVE TODAY ──
-        target_today = get_trades_target_today(week_trade_count)
-        pdt_used     = get_day_trade_count()
+        pdt_used      = get_day_trade_count()
+        allowed_today = get_trades_allowed_today(week_trade_count, trades_today)
 
         # ── FORCE EXIT NEAR CLOSE ──
         if is_near_market_close():
             for sym, pos in list(positions.items()):
                 try:
-                    exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
+                    exit_side  = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
+                    df_exit    = get_data(sym)
+                    exit_price = df_exit["close"].iloc[-1]
                     place_order(sym, exit_side, pos["qty"])
                     pnl, result = log_trade(sym, pos["side"], pos["entry"],
-                                            get_data(sym)["close"].iloc[-1],
-                                            pos["qty"], regime)
-                    weekly_pnl += pnl
-                    notify(f"EOD CLOSE {pos['side']} {sym} | ${pnl:+.2f} | Week P&L: ${weekly_pnl:.2f}")
+                                            exit_price, pos["qty"], regime)
+                    if CASH_ACCOUNT:
+                        proceeds = exit_price * pos["qty"]
+                        log_settlement(sym, proceeds, now_et)
+                    weekly_pnl       += pnl
+                    week_trade_count += 1
+                    trades_today     += 1
+                    notify(
+                        f"EOD CLOSE {pos['side']} {sym} | ${pnl:+.2f}\n"
+                        f"Week P&L: ${weekly_pnl:.2f} | Trades: {week_trade_count}"
+                    )
                     del positions[sym]
                 except Exception as e:
                     print(f"EOD close failed for {sym}: {e}")
@@ -688,11 +751,15 @@ while True:
                         place_order(symbol, exit_side, pos["qty"])
                         pnl, result = log_trade(symbol, pos["side"], entry,
                                                 current_price, pos["qty"], regime)
+                        if CASH_ACCOUNT:
+                            log_settlement(symbol, current_price * pos["qty"], now_et)
                         weekly_pnl       += pnl
                         week_trade_count += 1
+                        trades_today     += 1
                         notify(
-                            f"✅ {result} {pos['side']} {symbol} @ ${current_price:.2f}\n"
-                            f"P&L: +${pnl:.2f} | Week: ${weekly_pnl:.2f} | Trades: {week_trade_count}/3"
+                            f"✅ WIN {pos['side']} {symbol} @ ${current_price:.2f}\n"
+                            f"+${pnl:.2f} | Week P&L: ${weekly_pnl:.2f}\n"
+                            f"Trades today: {trades_today} | Week: {week_trade_count}"
                         )
                         del positions[symbol]
 
@@ -701,11 +768,15 @@ while True:
                         place_order(symbol, exit_side, pos["qty"])
                         pnl, result = log_trade(symbol, pos["side"], entry,
                                                 current_price, pos["qty"], regime)
+                        if CASH_ACCOUNT:
+                            log_settlement(symbol, current_price * pos["qty"], now_et)
                         weekly_pnl       += pnl
                         week_trade_count += 1
+                        trades_today     += 1
                         notify(
-                            f"🛑 {result} {pos['side']} {symbol} @ ${current_price:.2f}\n"
-                            f"P&L: ${pnl:.2f} | Week: ${weekly_pnl:.2f} | Trades: {week_trade_count}/3"
+                            f"🛑 LOSS {pos['side']} {symbol} @ ${current_price:.2f}\n"
+                            f"${pnl:.2f} | Week P&L: ${weekly_pnl:.2f}\n"
+                            f"Trades today: {trades_today} | Week: {week_trade_count}"
                         )
                         del positions[symbol]
 
@@ -713,35 +784,41 @@ while True:
                 elif (not is_after_no_entry_time()
                       and is_orb_window_complete()
                       and pdt_used < MAX_DAY_TRADES
-                      and week_trade_count < MAX_DAY_TRADES
-                      and target_today > 0
+                      and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
-                      and has_volume_confirmation(df)):
+                      and has_volume_confirmation(df)
+                      and can_afford_trade(current_price, qty)):
 
                     tp_amt, sl_amt = get_tp_sl(current_price, qty)
 
-                    if regime == "bullish" and current_price > high:
+                    # Bullish or choppy = longs
+                    if regime in ["bullish", "choppy"] and current_price > high * (1 + ORB_BUFFER):
                         place_order(symbol, OrderSide.BUY, qty)
                         positions[symbol] = {
                             "side": "LONG", "entry": current_price,
                             "tp": tp_amt, "sl": sl_amt, "qty": qty
                         }
-                        pdt_used += 1
+                        pdt_used     += 1
+                        allowed_today -= 1
                         notify(
                             f"📈 BUY {symbol} x{qty} @ ${current_price:.2f}\n"
-                            f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f} | PDT: {pdt_used}/3"
+                            f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
+                            f"2:1 ratio | PDT: {pdt_used} | Today: {trades_today+1}"
                         )
 
-                    elif regime == "bearish" and current_price < low:
+                    # Bearish = shorts
+                    elif regime == "bearish" and current_price < low * (1 - ORB_BUFFER):
                         place_order(symbol, OrderSide.SELL, qty)
                         positions[symbol] = {
                             "side": "SHORT", "entry": current_price,
                             "tp": tp_amt, "sl": sl_amt, "qty": qty
                         }
-                        pdt_used += 1
+                        pdt_used     += 1
+                        allowed_today -= 1
                         notify(
                             f"📉 SHORT {symbol} x{qty} @ ${current_price:.2f}\n"
-                            f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f} | PDT: {pdt_used}/3"
+                            f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
+                            f"2:1 ratio | PDT: {pdt_used} | Today: {trades_today+1}"
                         )
 
             except Exception as e:
