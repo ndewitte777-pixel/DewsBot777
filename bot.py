@@ -21,31 +21,29 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-TAKE_PROFIT      = 2.00
-STOP_LOSS        = 1.00
-MAX_WEEKLY_LOSS  = 6.00
-MAX_POSITIONS    = 1
-MIN_PRICE        = 10
-MAX_PRICE        = 100
-BASE_QTY         = 2
-QTY_PER_50       = 1
-MIN_TP_PCT       = 0.004
-MIN_SL_PCT       = 0.002
+TAKE_PROFIT     = 2.00   # $2.00 target per trade
+STOP_LOSS       = 1.00   # $1.00 stop per trade — 2:1 ratio
+MAX_WEEKLY_LOSS = 6.00   # circuit breaker — stops trading if weekly loss hits this
+MAX_DAY_TRADES  = 3      # PDT limit — 3 day trades per 5 business days
+MAX_POSITIONS   = 1      # one position at a time
+MIN_PRICE       = 10     # skip stocks below this price
+MAX_PRICE       = 100    # skip stocks above this price
+MAX_QTY         = 10     # hard cap on shares per trade
+BASE_QTY        = 2      # starting quantity
+QTY_PER_50      = 1      # add 1 share per $50 account growth above $250
+MIN_TP_PCT      = 0.004  # minimum 0.4% move for take profit
+MIN_SL_PCT      = 0.002  # minimum 0.2% move for stop loss
 
-REGIME_THRESHOLD  = 0.001
-VOLUME_MULTIPLIER = 1.2
-ORB_BUFFER        = 0.001
-
-CASH_ACCOUNT   = os.environ.get("CASH_ACCOUNT", "false").lower() == "true"
-MAX_DAY_TRADES = 999 if CASH_ACCOUNT else 3
-SETTLEMENT_DAYS = 2
+# Loosened entry filters so bot actually trades
+REGIME_THRESHOLD  = 0.001  # SPY needs 0.1% move to call bullish/bearish
+VOLUME_MULTIPLIER = 1.2    # breakout candle needs 20% above average volume
+ORB_BUFFER        = 0.001  # price needs 0.1% above ORB high/low to trigger
 
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
 PAPER_START_DATE = os.environ.get("PAPER_START_DATE", "2026-05-13")
 LOG_FILE         = "trade_log.csv"
-SETTLEMENT_FILE  = "settlement_log.csv"
 
 ET = pytz.timezone("America/New_York")
 
@@ -130,10 +128,6 @@ def init_log():
                 "date", "symbol", "side", "entry_price",
                 "exit_price", "qty", "pnl", "result", "regime"
             ])
-    if not os.path.exists(SETTLEMENT_FILE):
-        with open(SETTLEMENT_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["date", "symbol", "proceeds", "settles_on"])
 
 def log_trade(symbol, side, entry_price, exit_price, qty, regime):
     pnl    = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
@@ -167,68 +161,9 @@ def get_week_trades(trades):
 def _trade_week(trade):
     try:
         dt  = datetime.strptime(trade["date"], "%Y-%m-%d %H:%M")
-        iso = dt.isocalendar()
-        return (dt.year, iso[1])
+        return (dt.year, dt.isocalendar()[1])
     except Exception:
         return (0, 0)
-
-# =========================
-# CASH ACCOUNT SETTLEMENT
-# =========================
-
-def log_settlement(symbol, proceeds, trade_date):
-    settle_date = get_settlement_date(trade_date)
-    with open(SETTLEMENT_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            trade_date.strftime("%Y-%m-%d"),
-            symbol,
-            round(proceeds, 2),
-            settle_date.strftime("%Y-%m-%d")
-        ])
-
-def get_settlement_date(trade_date):
-    settle    = trade_date
-    days_added = 0
-    while days_added < SETTLEMENT_DAYS:
-        settle = settle + timedelta(days=1)
-        if settle.weekday() < 5:
-            days_added += 1
-    return settle
-
-def get_settled_cash():
-    if not CASH_ACCOUNT:
-        try:
-            account = trading_client.get_account()
-            return float(account.buying_power)
-        except Exception:
-            return 250.0
-    try:
-        account    = trading_client.get_account()
-        total_cash = float(account.cash)
-        today      = datetime.now(ET).date()
-        unsettled  = 0.0
-        if os.path.exists(SETTLEMENT_FILE):
-            with open(SETTLEMENT_FILE, "r") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    settle_date = datetime.strptime(row["settles_on"], "%Y-%m-%d").date()
-                    if settle_date > today:
-                        unsettled += float(row["proceeds"])
-        settled = max(0, total_cash - unsettled)
-        print(f"Cash — Total: ${total_cash:.2f} | Unsettled: ${unsettled:.2f} | Available: ${settled:.2f}")
-        return settled
-    except Exception as e:
-        print(f"Settlement check failed: {e}")
-        return 0.0
-
-def can_afford_trade(price, qty):
-    cost      = price * qty
-    available = get_settled_cash()
-    if available < cost:
-        print(f"Insufficient funds — need ${cost:.2f}, have ${available:.2f}")
-        return False
-    return True
 
 # =========================
 # STATS
@@ -286,18 +221,24 @@ def check_go_live_recommendation():
 
 # =========================
 # DYNAMIC QTY
+# Reads real account balance, scales 1 share per $50 growth
+# Hard capped at MAX_QTY so paper balance doesn't skew it
 # =========================
 
 def get_dynamic_qty():
     try:
         account  = trading_client.get_account()
         equity   = float(account.equity)
-        growth   = max(0, equity - 250)
-        qty      = BASE_QTY + int(growth / 50) * QTY_PER_50
-        max_safe = int((equity * 0.40) / MAX_PRICE)
-        qty      = max(1, min(qty, max_safe))
-        mode     = "CASH" if CASH_ACCOUNT else "MARGIN/PDT"
-        print(f"Equity: ${equity:.2f} | QTY: {qty} | Mode: {mode}")
+
+        # Use $250 as base regardless of paper balance
+        # This simulates real live account conditions
+        sim_equity = min(equity, 250.0 + max(0, equity - 100000))
+        growth     = max(0, sim_equity - 250)
+        qty        = BASE_QTY + int(growth / 50) * QTY_PER_50
+        max_safe   = int((sim_equity * 0.40) / MAX_PRICE)
+        qty        = max(1, min(qty, max_safe, MAX_QTY))
+
+        print(f"Equity: ${equity:.2f} | Simulated: ${sim_equity:.2f} | QTY: {qty}")
         return qty, equity
     except Exception as e:
         print(f"Could not get account equity: {e}")
@@ -316,32 +257,38 @@ def send_weekly_report(all_trades, equity, qty):
         weeks_running = max(1, int((datetime.now(ET) - start).days / 7))
     except Exception:
         weeks_running = 1
+
     if all_stats["win_rate"] >= 50:
-        projected     = equity * (1.05 ** 24)
+        projected      = 250 * (1.05 ** 24)
         projection_str = f"24mo projection: ~${projected:,.0f}"
     else:
         projection_str = "Win rate below 50% — review strategy"
+
     if all_stats["win_rate"] >= 60:
         trend = "🔥 Strong"
     elif all_stats["win_rate"] >= 50:
         trend = "✅ On track"
     else:
         trend = "⚠️ Below target"
+
     notify(
         f"📊 WEEKLY REPORT — Week {weeks_running}\n"
-        f"Account: ${equity:.2f} | QTY: {qty}\n"
-        f"Mode: {'CASH (no PDT)' if CASH_ACCOUNT else 'MARGIN (3/week)'}\n"
+        f"QTY: {qty} | PDT: 3 trades/week\n"
         f"─────────────────\n"
         f"THIS WEEK\n"
-        f"Trades: {week_stats['total']} | W: {week_stats['wins']} L: {week_stats['losses']}\n"
+        f"Trades: {week_stats['total']}/3 | "
+        f"W: {week_stats['wins']} L: {week_stats['losses']}\n"
         f"P&L: ${week_stats['total_pnl']}\n"
         f"─────────────────\n"
         f"ALL TIME\n"
-        f"Trades: {all_stats['total']} | Win rate: {all_stats['win_rate']}%\n"
+        f"Trades: {all_stats['total']} | "
+        f"Win rate: {all_stats['win_rate']}%\n"
         f"Total P&L: ${all_stats['total_pnl']}\n"
-        f"Avg win: ${all_stats['avg_win']} | Avg loss: ${all_stats['avg_loss']}\n"
+        f"Avg win: ${all_stats['avg_win']} | "
+        f"Avg loss: ${all_stats['avg_loss']}\n"
         f"Profit factor: {all_stats['profit_factor']}\n"
-        f"Status: {trend} | {projection_str}"
+        f"Status: {trend}\n"
+        f"{projection_str}"
     )
 
 # =========================
@@ -359,7 +306,8 @@ def is_market_open():
 def is_after_no_entry_time():
     now = datetime.now(ET)
     return (now.hour > NO_ENTRY_AFTER_HOUR or
-           (now.hour == NO_ENTRY_AFTER_HOUR and now.minute >= NO_ENTRY_AFTER_MINUTE))
+           (now.hour == NO_ENTRY_AFTER_HOUR and
+            now.minute >= NO_ENTRY_AFTER_MINUTE))
 
 def is_orb_window_complete():
     now = datetime.now(ET)
@@ -406,8 +354,7 @@ def get_market_regime():
         return "choppy"
 
 # =========================
-# SECTOR SCANNER — FIXED
-# Safe fallback if prev_daily_bar is missing
+# SECTOR SCANNER
 # =========================
 
 def get_top_sectors():
@@ -422,28 +369,23 @@ def get_top_sectors():
                 continue
             try:
                 cur  = snap.daily_bar.close
-                # FIXED: safe fallback if prev_daily_bar missing
                 prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
                 pct  = (cur - prev) / prev if prev else 0
                 scored.append((sector, pct))
             except Exception:
                 continue
         scored.sort(key=lambda x: x[1], reverse=True)
-        top = [s[0] for s in scored[:2]]
-        print(f"Top sectors: {top}")
-        return top
+        return [s[0] for s in scored[:2]]
     except Exception as e:
         print(f"Sector scan failed: {e}")
         return ["Technology", "ConsumerDisc"]
 
 # =========================
-# STOCK SCANNER — FIXED
-# Safe fallback if prev_daily_bar is missing
+# STOCK SCANNER
 # =========================
 
 def scan_symbols(regime):
     try:
-        # Get SPY change safely
         spy_req    = StockSnapshotRequest(symbol_or_symbols=["SPY"])
         spy_snap   = data_client.get_stock_snapshot(spy_req).get("SPY")
         spy_change = 0
@@ -463,32 +405,22 @@ def scan_symbols(regime):
         scored = []
         for sym, snap in snaps.items():
             try:
-                # FIXED: skip if no daily bar at all
                 if not snap or not snap.daily_bar:
                     continue
-
-                cur = snap.daily_bar.close
-                op  = snap.daily_bar.open
-                vol = snap.daily_bar.volume
-
-                # FIXED: safe fallback for prev_daily_bar
-                if snap.prev_daily_bar:
-                    prev = snap.prev_daily_bar.close
-                elif snap.latest_trade:
-                    prev = snap.latest_trade.price
-                else:
-                    prev = cur  # no reference — treat as flat
+                cur  = snap.daily_bar.close
+                op   = snap.daily_bar.open
+                vol  = snap.daily_bar.volume
+                prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
 
                 if cur < MIN_PRICE or cur > MAX_PRICE:
                     continue
 
-                # Earnings gap filter
-                overnight_gap = abs((op - prev) / prev) if prev else 0
-                if overnight_gap > 0.05:
-                    print(f"Skipping {sym} — earnings gap ({overnight_gap:.1%})")
+                # Skip earnings gaps
+                if prev and abs((op - prev) / prev) > 0.05:
+                    print(f"Skipping {sym} — earnings gap")
                     continue
 
-                rel_strength = ((cur - prev) / prev) - spy_change if prev else 0
+                rel_strength = ((cur - prev) / prev - spy_change) if prev else 0
                 score        = vol * abs(rel_strength)
 
                 if regime in ["bullish", "choppy"] and cur > prev:
@@ -505,12 +437,10 @@ def scan_symbols(regime):
         top = [s[0] for s in scored[:10]]
 
         if not top:
-            # Fallback if scanner returns nothing
             top = ["AMD", "SOFI", "F", "PLTR", "BAC"]
-            print(f"Scanner returned empty — using fallback: {top}")
-        else:
-            print(f"Watchlist ({regime}): {top}")
+            print(f"Scanner empty — using fallback: {top}")
 
+        print(f"Watchlist ({regime}): {top}")
         notify(f"Market: {regime.upper()} | Scanning: {', '.join(top)}")
         return top
 
@@ -531,8 +461,7 @@ def get_data(symbol):
         limit=100
     )
     bars = data_client.get_stock_bars(req)
-    df   = bars.df.reset_index()
-    return df
+    return bars.df.reset_index()
 
 # =========================
 # ORB LEVELS
@@ -544,7 +473,8 @@ def get_orb_levels(df):
         now_et     = datetime.now(ET)
         open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
         close_time = now_et.replace(hour=9,  minute=45, second=0, microsecond=0)
-        orb_bars   = df[(df["timestamp_et"] >= open_time) & (df["timestamp_et"] < close_time)]
+        orb_bars   = df[(df["timestamp_et"] >= open_time) &
+                        (df["timestamp_et"] < close_time)]
         if len(orb_bars) < 5:
             orb_bars = df.iloc[:15]
     except Exception:
@@ -568,13 +498,10 @@ def get_tp_sl(entry_price, qty):
     return tp, sl
 
 # =========================
-# PDT CHECK — FIXED
-# Retries up to 3 times on timeout
+# PDT CHECK — retries on timeout
 # =========================
 
 def get_day_trade_count():
-    if CASH_ACCOUNT:
-        return 0
     for attempt in range(3):
         try:
             account = trading_client.get_account()
@@ -600,18 +527,20 @@ def place_order(symbol, side, qty):
 
 # =========================
 # TRADE TARGETING
+# Spreads 3 trades across the week
+# Catches up on Thu/Fri if behind
 # =========================
 
 def get_trades_allowed_today(week_trade_count, trades_today):
-    if CASH_ACCOUNT:
-        return max(0, 3 - trades_today)
     now         = datetime.now(ET)
-    weekday     = now.weekday()
+    weekday     = now.weekday()   # Mon=0 Fri=4
     trades_left = MAX_DAY_TRADES - week_trade_count
     if trades_left <= 0:
         return 0
+    # Thu or Fri — use all remaining trades to hit 3 by end of week
     if weekday >= 3:
         return trades_left
+    # Mon/Tue/Wed — 1 per day, catch up if behind
     return min(trades_left, max(1, trades_left - (4 - weekday)))
 
 # =========================
@@ -632,8 +561,11 @@ report_sent      = False
 qty              = BASE_QTY
 equity           = 250.0
 
-mode_str = "CASH ACCOUNT (no PDT)" if CASH_ACCOUNT else "MARGIN ACCOUNT (PDT: 3/week)"
-notify(f"Bot started — {mode_str}\nTP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | Ratio: 2:1")
+notify(
+    f"Bot started — PDT margin account\n"
+    f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | "
+    f"Ratio: 2:1 | Max trades: 3/week"
+)
 
 # =========================
 # MAIN LOOP
@@ -665,24 +597,24 @@ while True:
             print(f"New day: {today} | QTY: {qty} | Equity: ${equity:.2f}")
             notify(
                 f"New day: {today}\n"
-                f"QTY: {qty} | Equity: ${equity:.2f}\n"
-                f"Target trades today: {allowed} | "
-                f"Week: {week_trade_count}/{'∞' if CASH_ACCOUNT else '3'}"
+                f"QTY: {qty} | Week trades: {week_trade_count}/3\n"
+                f"Target today: {allowed} trade(s)"
             )
             check_go_live_recommendation()
 
-        # ── WEEKLY REPORT — Monday 9 AM ──
+        # ── WEEKLY REPORT — Monday 9 AM ET ──
         if is_monday_morning() and not report_sent:
             all_trades = read_all_trades()
             send_weekly_report(all_trades, equity, qty)
             report_sent = True
 
         if not is_market_open():
-            print(f"Market closed — {now_et.strftime('%Y-%m-%d %H:%M ET')} — sleeping 60s")
+            print(f"Market closed — "
+                  f"{now_et.strftime('%Y-%m-%d %H:%M ET')} — sleeping 60s")
             time.sleep(60)
             continue
 
-        # ── BUILD WATCHLIST ──
+        # ── BUILD WATCHLIST after ORB window ──
         if not watchlist and is_orb_window_complete():
             regime    = get_market_regime()
             watchlist = scan_symbols(regime)
@@ -701,31 +633,31 @@ while True:
 
         # ── WEEKLY CIRCUIT BREAKER ──
         if weekly_pnl <= -MAX_WEEKLY_LOSS:
-            print(f"Weekly loss limit hit — sitting out")
+            print(f"Weekly loss limit hit (${weekly_pnl:.2f}) — sitting out")
             time.sleep(60)
             continue
 
         pdt_used      = get_day_trade_count()
         allowed_today = get_trades_allowed_today(week_trade_count, trades_today)
 
-        # ── FORCE EXIT NEAR CLOSE ──
+        # ── FORCE EXIT NEAR CLOSE (3:55 PM ET) ──
         if is_near_market_close():
             for sym, pos in list(positions.items()):
                 try:
                     exit_side  = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
-                    df_exit    = get_data(sym)
-                    exit_price = df_exit["close"].iloc[-1]
+                    exit_price = get_data(sym)["close"].iloc[-1]
                     place_order(sym, exit_side, pos["qty"])
-                    pnl, result = log_trade(sym, pos["side"], pos["entry"],
-                                            exit_price, pos["qty"], regime)
-                    if CASH_ACCOUNT:
-                        log_settlement(sym, exit_price * pos["qty"], now_et)
+                    pnl, result = log_trade(
+                        sym, pos["side"], pos["entry"],
+                        exit_price, pos["qty"], regime
+                    )
                     weekly_pnl       += pnl
                     week_trade_count += 1
                     trades_today     += 1
                     notify(
                         f"EOD CLOSE {pos['side']} {sym} | ${pnl:+.2f}\n"
-                        f"Week P&L: ${weekly_pnl:.2f} | Trades: {week_trade_count}"
+                        f"Week P&L: ${weekly_pnl:.2f} | "
+                        f"Trades: {week_trade_count}/3"
                     )
                     del positions[sym]
                 except Exception as e:
@@ -745,44 +677,44 @@ while True:
 
                 # ── MANAGE OPEN POSITION ──
                 if symbol in positions:
-                    pos   = positions[symbol]
-                    entry = pos["entry"]
-                    tp    = pos["tp"]
-                    sl    = pos["sl"]
-                    gain  = ((current_price - entry) * pos["qty"] if pos["side"] == "LONG"
-                             else (entry - current_price) * pos["qty"])
+                    pos  = positions[symbol]
+                    gain = ((current_price - pos["entry"]) * pos["qty"]
+                            if pos["side"] == "LONG"
+                            else (pos["entry"] - current_price) * pos["qty"])
 
-                    if gain >= tp:
+                    if gain >= pos["tp"]:
                         exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
                         place_order(symbol, exit_side, pos["qty"])
-                        pnl, result = log_trade(symbol, pos["side"], entry,
-                                                current_price, pos["qty"], regime)
-                        if CASH_ACCOUNT:
-                            log_settlement(symbol, current_price * pos["qty"], now_et)
+                        pnl, result = log_trade(
+                            symbol, pos["side"], pos["entry"],
+                            current_price, pos["qty"], regime
+                        )
                         weekly_pnl       += pnl
                         week_trade_count += 1
                         trades_today     += 1
                         notify(
-                            f"✅ WIN {pos['side']} {symbol} @ ${current_price:.2f}\n"
+                            f"✅ WIN {pos['side']} {symbol} "
+                            f"@ ${current_price:.2f}\n"
                             f"+${pnl:.2f} | Week P&L: ${weekly_pnl:.2f}\n"
-                            f"Trades today: {trades_today} | Week: {week_trade_count}"
+                            f"Trades: {week_trade_count}/3"
                         )
                         del positions[symbol]
 
-                    elif gain <= -sl:
+                    elif gain <= -pos["sl"]:
                         exit_side = OrderSide.SELL if pos["side"] == "LONG" else OrderSide.BUY
                         place_order(symbol, exit_side, pos["qty"])
-                        pnl, result = log_trade(symbol, pos["side"], entry,
-                                                current_price, pos["qty"], regime)
-                        if CASH_ACCOUNT:
-                            log_settlement(symbol, current_price * pos["qty"], now_et)
+                        pnl, result = log_trade(
+                            symbol, pos["side"], pos["entry"],
+                            current_price, pos["qty"], regime
+                        )
                         weekly_pnl       += pnl
                         week_trade_count += 1
                         trades_today     += 1
                         notify(
-                            f"🛑 LOSS {pos['side']} {symbol} @ ${current_price:.2f}\n"
+                            f"🛑 LOSS {pos['side']} {symbol} "
+                            f"@ ${current_price:.2f}\n"
                             f"${pnl:.2f} | Week P&L: ${weekly_pnl:.2f}\n"
-                            f"Trades today: {trades_today} | Week: {week_trade_count}"
+                            f"Trades: {week_trade_count}/3"
                         )
                         del positions[symbol]
 
@@ -790,39 +722,53 @@ while True:
                 elif (not is_after_no_entry_time()
                       and is_orb_window_complete()
                       and pdt_used < MAX_DAY_TRADES
+                      and week_trade_count < MAX_DAY_TRADES
                       and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
-                      and has_volume_confirmation(df)
-                      and can_afford_trade(current_price, qty)):
+                      and has_volume_confirmation(df)):
 
                     tp_amt, sl_amt = get_tp_sl(current_price, qty)
 
-                    if regime in ["bullish", "choppy"] and current_price > high * (1 + ORB_BUFFER):
+                    # Bullish or choppy — longs only
+                    if (regime in ["bullish", "choppy"]
+                            and current_price > high * (1 + ORB_BUFFER)):
                         place_order(symbol, OrderSide.BUY, qty)
                         positions[symbol] = {
-                            "side": "LONG", "entry": current_price,
-                            "tp": tp_amt, "sl": sl_amt, "qty": qty
+                            "side":  "LONG",
+                            "entry": current_price,
+                            "tp":    tp_amt,
+                            "sl":    sl_amt,
+                            "qty":   qty
                         }
                         pdt_used      += 1
                         allowed_today -= 1
                         notify(
-                            f"📈 BUY {symbol} x{qty} @ ${current_price:.2f}\n"
+                            f"📈 BUY {symbol} x{qty} "
+                            f"@ ${current_price:.2f}\n"
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
-                            f"2:1 ratio | Week: {week_trade_count+1}/{'∞' if CASH_ACCOUNT else '3'}"
+                            f"Week: {week_trade_count+1}/3 | "
+                            f"PDT used: {pdt_used}/3"
                         )
 
-                    elif regime == "bearish" and current_price < low * (1 - ORB_BUFFER):
+                    # Bearish — shorts only
+                    elif (regime == "bearish"
+                          and current_price < low * (1 - ORB_BUFFER)):
                         place_order(symbol, OrderSide.SELL, qty)
                         positions[symbol] = {
-                            "side": "SHORT", "entry": current_price,
-                            "tp": tp_amt, "sl": sl_amt, "qty": qty
+                            "side":  "SHORT",
+                            "entry": current_price,
+                            "tp":    tp_amt,
+                            "sl":    sl_amt,
+                            "qty":   qty
                         }
                         pdt_used      += 1
                         allowed_today -= 1
                         notify(
-                            f"📉 SHORT {symbol} x{qty} @ ${current_price:.2f}\n"
+                            f"📉 SHORT {symbol} x{qty} "
+                            f"@ ${current_price:.2f}\n"
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
-                            f"2:1 ratio | Week: {week_trade_count+1}/{'∞' if CASH_ACCOUNT else '3'}"
+                            f"Week: {week_trade_count+1}/3 | "
+                            f"PDT used: {pdt_used}/3"
                         )
 
             except Exception as e:
