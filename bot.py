@@ -21,34 +21,40 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-TAKE_PROFIT     = 2.00   # $2.00 target per trade
-STOP_LOSS       = 1.00   # $1.00 stop per trade — 2:1 ratio
-MAX_WEEKLY_LOSS = 6.00   # circuit breaker — stops trading if weekly loss hits this
-MAX_DAY_TRADES  = 3      # PDT limit — 3 day trades per 5 business days
+TAKE_PROFIT     = 2.00   # $2.00 target — 2:1 ratio
+STOP_LOSS       = 1.00   # $1.00 stop
+MAX_WEEKLY_LOSS = 6.00   # weekly circuit breaker
+MAX_DAY_TRADES  = 3      # PDT limit
 MAX_POSITIONS   = 1      # one position at a time
-MIN_PRICE       = 10     # skip stocks below this price
-MAX_PRICE       = 50     # skip stocks above this price — allows QTY 2 on $250 account
-MAX_QTY         = 10     # hard cap on shares per trade
-BASE_QTY        = 2      # starting quantity
-QTY_PER_50      = 1      # add 1 share per $50 account growth above $250
-MIN_TP_PCT      = 0.004  # minimum 0.4% move for take profit
-MIN_SL_PCT      = 0.002  # minimum 0.2% move for stop loss
+MIN_PRICE       = 10     # skip stocks below this
+MAX_PRICE       = 50     # skip stocks above this — keeps QTY 2 affordable
+MAX_QTY         = 10     # hard cap regardless of account size
+BASE_QTY        = 2      # starting shares
+QTY_PER_50      = 1      # +1 share per $50 account growth above $250
+MIN_TP_PCT      = 0.004  # minimum 0.4% for TP floor
+MIN_SL_PCT      = 0.002  # minimum 0.2% for SL floor
 
-# Loosened entry filters so bot actually trades
-REGIME_THRESHOLD  = 0.001  # SPY needs 0.1% move to call bullish/bearish
-VOLUME_MULTIPLIER = 1.2    # breakout candle needs 20% above average volume
-ORB_BUFFER        = 0.001  # price needs 0.1% above ORB high/low to trigger
+# Entry filters
+REGIME_THRESHOLD  = 0.001  # SPY needs 0.1% move to call bullish
+VOLUME_MULTIPLIER = 1.2    # volume confirmation multiplier (only after 10:30 AM)
+ORB_BUFFER        = 0.001  # price needs 0.1% above ORB high to trigger
+MIN_ORB_RANGE_PCT = 0.005  # ORB range must be at least 0.5% of price
+MIN_SPY_RANGE_PCT = 0.003  # SPY daily range must be at least 0.3% to trade
+ORB_VALID_UNTIL_HOUR   = 11  # no new ORB entries after this hour
+ORB_VALID_UNTIL_MINUTE = 45  # (entries only in first 2 hours of market)
 
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
 PAPER_START_DATE = os.environ.get("PAPER_START_DATE", "2026-05-13")
 LOG_FILE         = "trade_log.csv"
+SKIP_LOG_FILE    = "skip_log.csv"  # logs why trades were skipped each day
 
 ET = pytz.timezone("America/New_York")
 
 # =========================
 # SECTOR ETFS + STOCKS
+# Top 3 sectors scanned now instead of 2
 # =========================
 
 SECTOR_ETFS = {
@@ -65,11 +71,11 @@ SECTOR_ETFS = {
 }
 
 SECTOR_STOCKS = {
-    "Technology":   ["AAPL", "AMD", "INTC", "MU", "PLTR", "SNOW", "SOFI"],
+    "Technology":   ["AMD", "INTC", "MU", "PLTR", "SOFI"],
     "Energy":       ["XOM", "OXY", "SLB", "HAL"],
     "Financials":   ["BAC", "SOFI", "COIN", "MS"],
     "Healthcare":   ["PFE", "MRNA", "ABT", "CVS"],
-    "ConsumerDisc": ["TSLA", "F", "GM", "RIVN", "NIO"],
+    "ConsumerDisc": ["F", "GM", "RIVN", "NIO"],
     "Industrials":  ["GE", "HON", "UPS"],
     "Materials":    ["FCX", "AA", "CLF"],
     "Utilities":    ["NEE", "SO"],
@@ -128,9 +134,14 @@ def init_log():
                 "date", "symbol", "side", "entry_price",
                 "exit_price", "qty", "pnl", "result", "regime"
             ])
+    if not os.path.exists(SKIP_LOG_FILE):
+        with open(SKIP_LOG_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "symbol", "reason"])
 
 def log_trade(symbol, side, entry_price, exit_price, qty, regime):
-    pnl    = (exit_price - entry_price) * qty if side == "LONG" else (entry_price - exit_price) * qty
+    pnl    = ((exit_price - entry_price) * qty if side == "LONG"
+              else (entry_price - exit_price) * qty)
     result = "WIN" if pnl > 0 else "LOSS"
     with open(LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
@@ -141,6 +152,15 @@ def log_trade(symbol, side, entry_price, exit_price, qty, regime):
             qty, round(pnl, 2), result, regime
         ])
     return pnl, result
+
+def log_skip(symbol, reason):
+    """Log why a trade was skipped — helps tune strategy."""
+    with open(SKIP_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+            symbol, reason
+        ])
 
 def read_all_trades():
     trades = []
@@ -160,7 +180,7 @@ def get_week_trades(trades):
 
 def _trade_week(trade):
     try:
-        dt  = datetime.strptime(trade["date"], "%Y-%m-%d %H:%M")
+        dt = datetime.strptime(trade["date"], "%Y-%m-%d %H:%M")
         return (dt.year, dt.isocalendar()[1])
     except Exception:
         return (0, 0)
@@ -221,23 +241,17 @@ def check_go_live_recommendation():
 
 # =========================
 # DYNAMIC QTY
-# Reads real account balance, scales 1 share per $50 growth
-# Hard capped at MAX_QTY so paper balance doesn't skew it
 # =========================
 
 def get_dynamic_qty():
     try:
-        account  = trading_client.get_account()
-        equity   = float(account.equity)
-
-        # Use $250 as base regardless of paper balance
-        # This simulates real live account conditions
+        account    = trading_client.get_account()
+        equity     = float(account.equity)
         sim_equity = min(equity, 250.0 + max(0, equity - 100000))
         growth     = max(0, sim_equity - 250)
         qty        = BASE_QTY + int(growth / 50) * QTY_PER_50
         max_safe   = int((sim_equity * 0.40) / MAX_PRICE)
         qty        = max(1, min(qty, max_safe, MAX_QTY))
-
         print(f"Equity: ${equity:.2f} | Simulated: ${sim_equity:.2f} | QTY: {qty}")
         return qty, equity
     except Exception as e:
@@ -257,20 +271,17 @@ def send_weekly_report(all_trades, equity, qty):
         weeks_running = max(1, int((datetime.now(ET) - start).days / 7))
     except Exception:
         weeks_running = 1
-
     if all_stats["win_rate"] >= 50:
         projected      = 250 * (1.05 ** 24)
         projection_str = f"24mo projection: ~${projected:,.0f}"
     else:
         projection_str = "Win rate below 50% — review strategy"
-
     if all_stats["win_rate"] >= 60:
         trend = "🔥 Strong"
     elif all_stats["win_rate"] >= 50:
         trend = "✅ On track"
     else:
         trend = "⚠️ Below target"
-
     notify(
         f"📊 WEEKLY REPORT — Week {weeks_running}\n"
         f"QTY: {qty} | PDT: 3 trades/week\n"
@@ -287,8 +298,26 @@ def send_weekly_report(all_trades, equity, qty):
         f"Avg win: ${all_stats['avg_win']} | "
         f"Avg loss: ${all_stats['avg_loss']}\n"
         f"Profit factor: {all_stats['profit_factor']}\n"
-        f"Status: {trend}\n"
-        f"{projection_str}"
+        f"Status: {trend} | {projection_str}"
+    )
+
+# =========================
+# END OF DAY SUMMARY
+# Sent at 4 PM ET — shows what happened today
+# =========================
+
+def send_eod_summary(regime, watchlist, trades_today,
+                     weekly_pnl, week_trade_count, no_trade_reason):
+    reason_str = f"No trade reason: {no_trade_reason}" if no_trade_reason else ""
+    notify(
+        f"📋 END OF DAY — "
+        f"{datetime.now(ET).strftime('%b %d')}\n"
+        f"Regime: {regime.upper()} | "
+        f"Trades today: {trades_today}\n"
+        f"Week: {week_trade_count}/3 | "
+        f"Week P&L: ${weekly_pnl:.2f}\n"
+        f"Watchlist: {', '.join(watchlist[:5]) if watchlist else 'None'}\n"
+        f"{reason_str}"
     )
 
 # =========================
@@ -313,18 +342,39 @@ def is_orb_window_complete():
     now = datetime.now(ET)
     return now >= now.replace(hour=9, minute=45, second=0, microsecond=0)
 
+def is_orb_still_valid():
+    """ORB entries only allowed in first 2 hours — signal weakens after that."""
+    now = datetime.now(ET)
+    cutoff = now.replace(
+        hour=ORB_VALID_UNTIL_HOUR,
+        minute=ORB_VALID_UNTIL_MINUTE,
+        second=0, microsecond=0
+    )
+    return now < cutoff
+
 def is_near_market_close():
     now          = datetime.now(ET)
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     diff         = (market_close - now).total_seconds()
     return 0 < diff <= 300
 
+def is_early_session():
+    """Before 10:30 AM — skip volume check, use price action only."""
+    now = datetime.now(ET)
+    return now.hour < 10 or (now.hour == 10 and now.minute < 30)
+
 def is_monday_morning():
     now = datetime.now(ET)
     return now.weekday() == 0 and now.hour == 9 and now.minute < 31
 
+def is_market_close_time():
+    """Exactly at 4 PM — trigger EOD summary."""
+    now = datetime.now(ET)
+    return now.hour == 16 and now.minute == 0
+
 # =========================
 # MARKET REGIME
+# Includes SPY range check — won't trade if market is too flat
 # =========================
 
 def get_market_regime():
@@ -338,11 +388,19 @@ def get_market_regime():
         open_price    = df["open"].iloc[0]
         current_price = df["close"].iloc[-1]
         daily_change  = (current_price - open_price) / open_price
-        mid           = len(df) // 2
-        higher_highs  = df["high"].iloc[mid:].max() > df["high"].iloc[:mid].max()
-        higher_lows   = df["low"].iloc[mid:].min()  > df["low"].iloc[:mid].min()
-        lower_highs   = df["high"].iloc[mid:].max() < df["high"].iloc[:mid].max()
-        lower_lows    = df["low"].iloc[mid:].min()  < df["low"].iloc[:mid].min()
+
+        # NEW: check SPY has enough range to trade
+        spy_range = (df["high"].max() - df["low"].min()) / open_price
+        if spy_range < MIN_SPY_RANGE_PCT:
+            print(f"SPY range too tight ({spy_range:.3%}) — calling choppy")
+            return "choppy"
+
+        mid          = len(df) // 2
+        higher_highs = df["high"].iloc[mid:].max() > df["high"].iloc[:mid].max()
+        higher_lows  = df["low"].iloc[mid:].min()  > df["low"].iloc[:mid].min()
+        lower_highs  = df["high"].iloc[mid:].max() < df["high"].iloc[:mid].max()
+        lower_lows   = df["low"].iloc[mid:].min()  < df["low"].iloc[:mid].min()
+
         if daily_change > REGIME_THRESHOLD and (higher_highs or higher_lows):
             return "bullish"
         elif daily_change < -REGIME_THRESHOLD and (lower_highs or lower_lows):
@@ -354,7 +412,7 @@ def get_market_regime():
         return "choppy"
 
 # =========================
-# SECTOR SCANNER
+# SECTOR SCANNER — top 3 sectors now
 # =========================
 
 def get_top_sectors():
@@ -375,10 +433,12 @@ def get_top_sectors():
             except Exception:
                 continue
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [s[0] for s in scored[:2]]
+        top = [s[0] for s in scored[:3]]  # top 3 sectors now
+        print(f"Top sectors: {top}")
+        return top
     except Exception as e:
         print(f"Sector scan failed: {e}")
-        return ["Technology", "ConsumerDisc"]
+        return ["Technology", "ConsumerDisc", "Financials"]
 
 # =========================
 # STOCK SCANNER
@@ -424,8 +484,6 @@ def scan_symbols(regime):
                 score        = vol * abs(rel_strength)
 
                 if regime in ["bullish", "choppy"] and cur > prev:
-                    score *= 1.5
-                elif regime == "bearish" and cur < prev:
                     score *= 1.5
 
                 scored.append((sym, score))
@@ -481,12 +539,32 @@ def get_orb_levels(df):
         orb_bars = df.iloc[:15]
     return orb_bars["high"].max(), orb_bars["low"].min()
 
+def is_orb_range_valid(high, low, current_price):
+    """ORB range must be at least 0.5% of price — filters out flat open days."""
+    orb_range = (high - low) / current_price
+    if orb_range < MIN_ORB_RANGE_PCT:
+        return False, f"ORB range too tight ({orb_range:.3%})"
+    return True, ""
+
 # =========================
 # VOLUME CONFIRMATION
+# Skipped before 10:30 AM — early volume is unreliable
 # =========================
 
 def has_volume_confirmation(df):
+    if is_early_session():
+        return True  # skip volume check before 10:30 AM
     return df["volume"].iloc[-1] > df["volume"].mean() * VOLUME_MULTIPLIER
+
+# =========================
+# DYNAMIC QTY per stock price
+# =========================
+
+def get_position_qty(price, equity):
+    """Risk 20% of account per trade, adjusted for stock price."""
+    risk_per_trade = equity * 0.20
+    qty            = max(1, int(risk_per_trade / price))
+    return min(qty, MAX_QTY)
 
 # =========================
 # DYNAMIC TP/SL
@@ -527,20 +605,16 @@ def place_order(symbol, side, qty):
 
 # =========================
 # TRADE TARGETING
-# Spreads 3 trades across the week
-# Catches up on Thu/Fri if behind
 # =========================
 
 def get_trades_allowed_today(week_trade_count, trades_today):
     now         = datetime.now(ET)
-    weekday     = now.weekday()   # Mon=0 Fri=4
+    weekday     = now.weekday()
     trades_left = MAX_DAY_TRADES - week_trade_count
     if trades_left <= 0:
         return 0
-    # Thu or Fri — use all remaining trades to hit 3 by end of week
-    if weekday >= 3:
+    if weekday >= 3:  # Thu/Fri — use all remaining
         return trades_left
-    # Mon/Tue/Wed — 1 per day, catch up if behind
     return min(trades_left, max(1, trades_left - (4 - weekday)))
 
 # =========================
@@ -558,13 +632,16 @@ weekly_pnl       = 0.0
 week_trade_count = 0
 trades_today     = 0
 report_sent      = False
+eod_sent         = False
+no_trade_reason  = ""
 qty              = BASE_QTY
 equity           = 250.0
 
 notify(
     f"Bot started — PDT margin account\n"
     f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | "
-    f"Ratio: 2:1 | Max trades: 3/week"
+    f"Ratio: 2:1 | Max: 3 trades/week\n"
+    f"ORB valid until: {ORB_VALID_UNTIL_HOUR}:{ORB_VALID_UNTIL_MINUTE:02d} ET"
 )
 
 # =========================
@@ -587,18 +664,21 @@ while True:
 
         # ── NEW DAY RESET ──
         if last_date != today:
-            positions    = {}
-            watchlist    = []
-            regime       = "choppy"
-            trades_today = 0
-            last_date    = today
-            qty, equity  = get_dynamic_qty()
-            allowed      = get_trades_allowed_today(week_trade_count, 0)
+            positions       = {}
+            watchlist       = []
+            regime          = "choppy"
+            trades_today    = 0
+            eod_sent        = False
+            no_trade_reason = ""
+            last_date       = today
+            qty, equity     = get_dynamic_qty()
+            allowed         = get_trades_allowed_today(week_trade_count, 0)
             print(f"New day: {today} | QTY: {qty} | Equity: ${equity:.2f}")
             notify(
                 f"New day: {today}\n"
-                f"QTY: {qty} | Week trades: {week_trade_count}/3\n"
-                f"Target today: {allowed} trade(s)"
+                f"QTY: {qty} | Equity: ${equity:.2f}\n"
+                f"Target trades today: {allowed} | "
+                f"Week: {week_trade_count}/3"
             )
             check_go_live_recommendation()
 
@@ -613,6 +693,14 @@ while True:
                   f"{now_et.strftime('%Y-%m-%d %H:%M ET')} — sleeping 60s")
             time.sleep(60)
             continue
+
+        # ── EOD SUMMARY — 4 PM ET ──
+        if is_market_close_time() and not eod_sent:
+            send_eod_summary(
+                regime, watchlist, trades_today,
+                weekly_pnl, week_trade_count, no_trade_reason
+            )
+            eod_sent = True
 
         # ── BUILD WATCHLIST after ORB window ──
         if not watchlist and is_orb_window_complete():
@@ -633,9 +721,18 @@ while True:
 
         # ── WEEKLY CIRCUIT BREAKER ──
         if weekly_pnl <= -MAX_WEEKLY_LOSS:
-            print(f"Weekly loss limit hit (${weekly_pnl:.2f}) — sitting out")
+            no_trade_reason = f"Weekly loss limit hit (${weekly_pnl:.2f})"
+            print(no_trade_reason)
             time.sleep(60)
             continue
+
+        # ── THURSDAY REMINDER if behind on trades ──
+        if (now_et.weekday() == 3 and now_et.hour == 9
+                and now_et.minute == 45 and week_trade_count == 0):
+            notify(
+                f"⚠️ Thursday — 0 trades this week\n"
+                f"Bot will attempt all 3 trades today/tomorrow"
+            )
 
         pdt_used      = get_day_trade_count()
         allowed_today = get_trades_allowed_today(week_trade_count, trades_today)
@@ -721,40 +818,58 @@ while True:
                 # ── LOOK FOR NEW ENTRY ──
                 elif (not is_after_no_entry_time()
                       and is_orb_window_complete()
+                      and is_orb_still_valid()
                       and pdt_used < MAX_DAY_TRADES
                       and week_trade_count < MAX_DAY_TRADES
                       and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
                       and has_volume_confirmation(df)):
 
-                    tp_amt, sl_amt = get_tp_sl(current_price, qty)
+                    # ORB range validity check
+                    valid_orb, skip_reason = is_orb_range_valid(high, low, current_price)
+                    if not valid_orb:
+                        log_skip(symbol, skip_reason)
+                        no_trade_reason = skip_reason
+                        continue
+
+                    # Dynamic QTY based on stock price
+                    trade_qty      = get_position_qty(current_price, equity)
+                    tp_amt, sl_amt = get_tp_sl(current_price, trade_qty)
 
                     # Bullish or choppy — longs only
                     if (regime in ["bullish", "choppy"]
                             and current_price > high * (1 + ORB_BUFFER)):
-                        place_order(symbol, OrderSide.BUY, qty)
+                        place_order(symbol, OrderSide.BUY, trade_qty)
                         positions[symbol] = {
                             "side":  "LONG",
                             "entry": current_price,
                             "tp":    tp_amt,
                             "sl":    sl_amt,
-                            "qty":   qty
+                            "qty":   trade_qty
                         }
                         pdt_used      += 1
                         allowed_today -= 1
+                        no_trade_reason = ""
                         notify(
-                            f"📈 BUY {symbol} x{qty} "
+                            f"📈 BUY {symbol} x{trade_qty} "
                             f"@ ${current_price:.2f}\n"
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
                             f"Week: {week_trade_count+1}/3 | "
                             f"PDT used: {pdt_used}/3"
                         )
+                    else:
+                        # Log why no entry was taken
+                        if regime == "bearish":
+                            reason = "Bearish regime — longs disabled"
+                        elif current_price <= high * (1 + ORB_BUFFER):
+                            reason = f"Price ${current_price:.2f} below ORB high ${high:.2f}"
+                        else:
+                            reason = "No setup"
+                        log_skip(symbol, reason)
+                        if not no_trade_reason:
+                            no_trade_reason = reason
 
-                    # Shorting disabled — Alpaca paper accounts don't support it
-                    # Bot sits out on bearish days rather than attempting shorts
             except Exception as e:
-            except Exception as e:
-                # Suppress spam — only print non-shorting errors
                 if "not allowed to short" not in str(e):
                     print(f"Error processing {symbol}: {e}")
                 continue
