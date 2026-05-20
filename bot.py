@@ -750,29 +750,13 @@ while True:
                             f"PDT used: {pdt_used}/3"
                         )
 
-                    # Bearish — shorts only
-                    elif (regime == "bearish"
-                          and current_price < low * (1 - ORB_BUFFER)):
-                        place_order(symbol, OrderSide.SELL, qty)
-                        positions[symbol] = {
-                            "side":  "SHORT",
-                            "entry": current_price,
-                            "tp":    tp_amt,
-                            "sl":    sl_amt,
-                            "qty":   qty
-                        }
-                        pdt_used      += 1
-                        allowed_today -= 1
-                        notify(
-                            f"📉 SHORT {symbol} x{qty} "
-                            f"@ ${current_price:.2f}\n"
-                            f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
-                            f"Week: {week_trade_count+1}/3 | "
-                            f"PDT used: {pdt_used}/3"
-                        )
-
+                    # Shorting disabled — Alpaca paper accounts don't support it
+                    # Bot sits out on bearish days rather than attempting shorts
             except Exception as e:
-                print(f"Error processing {symbol}: {e}")
+            except Exception as e:
+                # Suppress spam — only print non-shorting errors
+                if "not allowed to short" not in str(e):
+                    print(f"Error processing {symbol}: {e}")
                 continue
 
         time.sleep(60)
