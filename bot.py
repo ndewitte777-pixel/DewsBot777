@@ -53,8 +53,16 @@ NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
 PAPER_START_DATE = os.environ.get("PAPER_START_DATE", "2026-05-13")
-LOG_FILE         = "trade_log.csv"
-SKIP_LOG_FILE    = "skip_log.csv"
+
+# DATA_DIR uses Railway Volume if set, otherwise current folder
+# Add Volume in Railway dashboard, mount at /data
+# Then add Railway Variable: DATA_DIR = /data
+DATA_DIR      = os.environ.get("DATA_DIR", ".")
+LOG_FILE      = os.path.join(DATA_DIR, "trade_log.csv")
+SKIP_LOG_FILE = os.path.join(DATA_DIR, "skip_log.csv")
+
+# Create data directory if it doesn't exist
+os.makedirs(DATA_DIR, exist_ok=True)
 
 ET = pytz.timezone("America/New_York")
 
