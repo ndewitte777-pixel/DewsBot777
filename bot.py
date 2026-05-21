@@ -654,20 +654,63 @@ def get_trades_allowed_today(week_trade_count, trades_today):
     return min(trades_left, max(1, trades_left - (4 - weekday)))
 
 # =========================
+# STATE RECOVERY
+# Reads trade log on startup so restarts don't lose weekly counts
+# =========================
+
+def recover_state():
+    """
+    Reads trade_log.csv to recover week_trade_count and weekly_pnl
+    so a mid-week restart doesn't think it has 3 fresh trades.
+    Also recovers trades_today for the current day.
+    """
+    try:
+        all_trades  = read_all_trades()
+        now         = datetime.now(ET)
+        cur_week    = now.isocalendar()[1]
+        cur_year    = now.year
+        today_str   = now.strftime("%Y-%m-%d")
+
+        week_trades = [t for t in all_trades
+                       if _trade_week(t) == (cur_year, cur_week)]
+        today_trades = [t for t in week_trades
+                        if t["date"].startswith(today_str)]
+
+        week_trade_count = len(week_trades)
+        weekly_pnl       = sum(float(t["pnl"]) for t in week_trades)
+        trades_today     = len(today_trades)
+
+        if week_trade_count > 0:
+            print(
+                f"State recovered from log — "
+                f"week trades: {week_trade_count}/3 | "
+                f"week P&L: ${weekly_pnl:.2f} | "
+                f"trades today: {trades_today}"
+            )
+        return week_trade_count, weekly_pnl, trades_today
+
+    except Exception as e:
+        print(f"State recovery failed: {e} — starting fresh")
+        return 0, 0.0, 0
+
+# =========================
 # STATE
 # =========================
 
 init_log()
 
+# Recover persistent state from trade log
+_wtc, _wpnl, _tt  = recover_state()
+
 positions        = {}
 watchlist        = []
-scanner_failed   = False   # tracks if scanner needs retry
+scanner_failed   = False
 regime           = "choppy"
 last_date        = None
 last_week        = None
-weekly_pnl       = 0.0
-week_trade_count = 0
-trades_today     = 0
+weekly_pnl       = _wpnl
+week_trade_count = _wtc
+trades_today     = _tt
 report_sent      = False
 eod_sent         = False
 no_trade_reason  = ""
@@ -677,7 +720,9 @@ equity           = 250.0
 notify(
     f"Bot started — PDT margin account\n"
     f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | Ratio: 2:1\n"
-    f"Max: 3 trades/week | ORB valid until "
+    f"Week trades so far: {week_trade_count}/3 | "
+    f"Week P&L: ${weekly_pnl:.2f}\n"
+    f"ORB valid until "
     f"{ORB_VALID_UNTIL_HOUR}:{ORB_VALID_UNTIL_MINUTE:02d} ET"
 )
 
