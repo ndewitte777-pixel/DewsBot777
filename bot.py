@@ -26,8 +26,8 @@ STOP_LOSS       = 1.00   # $1.00 stop
 MAX_WEEKLY_LOSS = 6.00   # weekly circuit breaker
 MAX_DAY_TRADES  = 3      # PDT limit
 MAX_POSITIONS   = 1      # one position at a time
-MIN_PRICE       = 10     # skip stocks below this
-MAX_PRICE       = 50     # skip stocks above this — keeps QTY 2 affordable
+MIN_PRICE       = 5      # skip stocks below this
+MAX_PRICE       = 49     # skip stocks above this (strict — keeps BAC out)
 MAX_QTY         = 10     # hard cap regardless of account size
 BASE_QTY        = 2      # starting shares
 QTY_PER_50      = 1      # +1 share per $50 account growth above $250
@@ -35,26 +35,33 @@ MIN_TP_PCT      = 0.004  # minimum 0.4% for TP floor
 MIN_SL_PCT      = 0.002  # minimum 0.2% for SL floor
 
 # Entry filters
-REGIME_THRESHOLD  = 0.001  # SPY needs 0.1% move to call bullish
-VOLUME_MULTIPLIER = 1.2    # volume confirmation multiplier (only after 10:30 AM)
-ORB_BUFFER        = 0.001  # price needs 0.1% above ORB high to trigger
-MIN_ORB_RANGE_PCT = 0.005  # ORB range must be at least 0.5% of price
-MIN_SPY_RANGE_PCT = 0.003  # SPY daily range must be at least 0.3% to trade
-ORB_VALID_UNTIL_HOUR   = 11  # no new ORB entries after this hour
-ORB_VALID_UNTIL_MINUTE = 45  # (entries only in first 2 hours of market)
+REGIME_THRESHOLD      = 0.001  # SPY needs 0.1% move to call bullish
+VOLUME_MULTIPLIER     = 1.2    # volume check multiplier (after 10:30 AM only)
+ORB_BUFFER            = 0.001  # price needs 0.1% above ORB high
+MIN_ORB_RANGE_PCT     = 0.005  # ORB range must be at least 0.5% of price
+MIN_SPY_RANGE_PCT     = 0.003  # SPY must move at least 0.3% total to trade
+RELATIVE_STRENGTH_MIN = 0.001  # stock must outperform SPY by 0.1% minimum
+
+# ORB validity window — no new entries after 11:45 AM
+ORB_VALID_UNTIL_HOUR   = 11
+ORB_VALID_UNTIL_MINUTE = 45
+
+# Scanner retry — if scanner fails at 9:45, retry at this minute
+SCANNER_RETRY_MINUTE = 50  # retry at 9:50 AM
 
 NO_ENTRY_AFTER_HOUR   = 15
 NO_ENTRY_AFTER_MINUTE = 30
 
 PAPER_START_DATE = os.environ.get("PAPER_START_DATE", "2026-05-13")
 LOG_FILE         = "trade_log.csv"
-SKIP_LOG_FILE    = "skip_log.csv"  # logs why trades were skipped each day
+SKIP_LOG_FILE    = "skip_log.csv"
 
 ET = pytz.timezone("America/New_York")
 
 # =========================
 # SECTOR ETFS + STOCKS
-# Top 3 sectors scanned now instead of 2
+# BAC removed from fallback — above MAX_PRICE
+# All stocks verified under $49
 # =========================
 
 SECTOR_ETFS = {
@@ -71,17 +78,20 @@ SECTOR_ETFS = {
 }
 
 SECTOR_STOCKS = {
-    "Technology":   ["AMD", "INTC", "MU", "PLTR", "SOFI"],
-    "Energy":       ["XOM", "OXY", "SLB", "HAL"],
-    "Financials":   ["BAC", "SOFI", "COIN", "MS"],
-    "Healthcare":   ["PFE", "MRNA", "ABT", "CVS"],
-    "ConsumerDisc": ["F", "GM", "RIVN", "NIO"],
-    "Industrials":  ["GE", "HON", "UPS"],
-    "Materials":    ["FCX", "AA", "CLF"],
-    "Utilities":    ["NEE", "SO"],
-    "RealEstate":   ["SPG"],
+    "Technology":   ["AMD", "INTC", "MU", "PLTR", "SOFI", "SNAP"],
+    "Energy":       ["OXY", "SLB", "HAL", "DVN"],
+    "Financials":   ["SOFI", "COIN", "NU", "HOOD"],
+    "Healthcare":   ["PFE", "MRNA", "NVAX", "SAVA"],
+    "ConsumerDisc": ["F", "GM", "RIVN", "NIO", "LCID"],
+    "Industrials":  ["GE", "AAL", "UAL", "DAL"],
+    "Materials":    ["FCX", "AA", "CLF", "MT"],
+    "Utilities":    ["NEE", "SO", "PCG"],
+    "RealEstate":   ["SPG", "OPEN"],
     "ConsumerStap": ["WMT", "KO"],
 }
+
+# Fallback watchlist — all verified under $49, no BAC
+FALLBACK_SYMBOLS = ["AMD", "SOFI", "F", "PLTR", "NIO", "SNAP", "RIVN"]
 
 # =========================
 # INIT CLIENTS
@@ -154,7 +164,6 @@ def log_trade(symbol, side, entry_price, exit_price, qty, regime):
     return pnl, result
 
 def log_skip(symbol, reason):
-    """Log why a trade was skipped — helps tune strategy."""
     with open(SKIP_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -302,13 +311,13 @@ def send_weekly_report(all_trades, equity, qty):
     )
 
 # =========================
-# END OF DAY SUMMARY
-# Sent at 4 PM ET — shows what happened today
+# EOD SUMMARY
 # =========================
 
 def send_eod_summary(regime, watchlist, trades_today,
                      weekly_pnl, week_trade_count, no_trade_reason):
-    reason_str = f"No trade reason: {no_trade_reason}" if no_trade_reason else ""
+    reason_str = f"No trade: {no_trade_reason}" if (trades_today == 0
+                                                     and no_trade_reason) else ""
     notify(
         f"📋 END OF DAY — "
         f"{datetime.now(ET).strftime('%b %d')}\n"
@@ -316,7 +325,8 @@ def send_eod_summary(regime, watchlist, trades_today,
         f"Trades today: {trades_today}\n"
         f"Week: {week_trade_count}/3 | "
         f"Week P&L: ${weekly_pnl:.2f}\n"
-        f"Watchlist: {', '.join(watchlist[:5]) if watchlist else 'None'}\n"
+        f"Watchlist: "
+        f"{', '.join(watchlist[:5]) if watchlist else 'None'}\n"
         f"{reason_str}"
     )
 
@@ -343,8 +353,7 @@ def is_orb_window_complete():
     return now >= now.replace(hour=9, minute=45, second=0, microsecond=0)
 
 def is_orb_still_valid():
-    """ORB entries only allowed in first 2 hours — signal weakens after that."""
-    now = datetime.now(ET)
+    now    = datetime.now(ET)
     cutoff = now.replace(
         hour=ORB_VALID_UNTIL_HOUR,
         minute=ORB_VALID_UNTIL_MINUTE,
@@ -359,7 +368,6 @@ def is_near_market_close():
     return 0 < diff <= 300
 
 def is_early_session():
-    """Before 10:30 AM — skip volume check, use price action only."""
     now = datetime.now(ET)
     return now.hour < 10 or (now.hour == 10 and now.minute < 30)
 
@@ -368,13 +376,17 @@ def is_monday_morning():
     return now.weekday() == 0 and now.hour == 9 and now.minute < 31
 
 def is_market_close_time():
-    """Exactly at 4 PM — trigger EOD summary."""
     now = datetime.now(ET)
     return now.hour == 16 and now.minute == 0
 
+def is_scanner_retry_time():
+    """9:50 AM — retry scanner if it failed at 9:45."""
+    now = datetime.now(ET)
+    return (now.hour == 9 and now.minute == SCANNER_RETRY_MINUTE)
+
 # =========================
 # MARKET REGIME
-# Includes SPY range check — won't trade if market is too flat
+# Includes SPY range check — won't trade flat days
 # =========================
 
 def get_market_regime():
@@ -389,10 +401,10 @@ def get_market_regime():
         current_price = df["close"].iloc[-1]
         daily_change  = (current_price - open_price) / open_price
 
-        # NEW: check SPY has enough range to trade
+        # SPY range check — sit out if market is too flat
         spy_range = (df["high"].max() - df["low"].min()) / open_price
         if spy_range < MIN_SPY_RANGE_PCT:
-            print(f"SPY range too tight ({spy_range:.3%}) — calling choppy")
+            print(f"SPY range too tight ({spy_range:.3%}) — choppy")
             return "choppy"
 
         mid          = len(df) // 2
@@ -411,8 +423,21 @@ def get_market_regime():
         print(f"Regime check failed: {e}")
         return "choppy"
 
+def get_spy_daily_change():
+    """Returns SPY % change today — used for relative strength filter."""
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=["SPY"],
+            timeframe=TimeFrame.Minute,
+            limit=100
+        )
+        df  = data_client.get_stock_bars(req).df.reset_index()
+        return (df["close"].iloc[-1] - df["open"].iloc[0]) / df["open"].iloc[0]
+    except Exception:
+        return 0.0
+
 # =========================
-# SECTOR SCANNER — top 3 sectors now
+# SECTOR SCANNER — top 3 sectors
 # =========================
 
 def get_top_sectors():
@@ -433,25 +458,25 @@ def get_top_sectors():
             except Exception:
                 continue
         scored.sort(key=lambda x: x[1], reverse=True)
-        top = [s[0] for s in scored[:3]]  # top 3 sectors now
-        print(f"Top sectors: {top}")
-        return top
+        return [s[0] for s in scored[:3]]
     except Exception as e:
         print(f"Sector scan failed: {e}")
         return ["Technology", "ConsumerDisc", "Financials"]
 
 # =========================
 # STOCK SCANNER
+# Added: relative strength filter vs SPY
+# Improved: safer prev_daily_bar handling
 # =========================
 
 def scan_symbols(regime):
+    """
+    Returns scored watchlist or None if data isn't ready yet.
+    Returning None triggers a retry at 9:50 AM.
+    """
     try:
-        spy_req    = StockSnapshotRequest(symbol_or_symbols=["SPY"])
-        spy_snap   = data_client.get_stock_snapshot(spy_req).get("SPY")
-        spy_change = 0
-        if spy_snap and spy_snap.daily_bar and spy_snap.prev_daily_bar:
-            spy_change = ((spy_snap.daily_bar.close - spy_snap.prev_daily_bar.close)
-                          / spy_snap.prev_daily_bar.close)
+        # Get SPY change for relative strength
+        spy_change = get_spy_daily_change()
 
         top_sectors = get_top_sectors()
         candidates  = []
@@ -461,6 +486,16 @@ def scan_symbols(regime):
 
         req   = StockSnapshotRequest(symbol_or_symbols=candidates)
         snaps = data_client.get_stock_snapshot(req)
+
+        # Count how many have prev_daily_bar — if too few, data isn't ready
+        prev_bar_count = sum(
+            1 for snap in snaps.values()
+            if snap and snap.prev_daily_bar
+        )
+        total = len(snaps)
+        if total > 0 and prev_bar_count / total < 0.5:
+            print(f"Only {prev_bar_count}/{total} stocks have prev bar — retrying later")
+            return None  # signal to retry
 
         scored = []
         for sym, snap in snaps.items():
@@ -472,17 +507,22 @@ def scan_symbols(regime):
                 vol  = snap.daily_bar.volume
                 prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
 
+                # Price filter
                 if cur < MIN_PRICE or cur > MAX_PRICE:
                     continue
 
-                # Skip earnings gaps
+                # Earnings gap filter
                 if prev and abs((op - prev) / prev) > 0.05:
                     print(f"Skipping {sym} — earnings gap")
                     continue
 
-                rel_strength = ((cur - prev) / prev - spy_change) if prev else 0
-                score        = vol * abs(rel_strength)
+                # Relative strength filter — must outperform SPY
+                stock_change = (cur - prev) / prev if prev else 0
+                rel_strength = stock_change - spy_change
+                if regime in ["bullish", "choppy"] and rel_strength < RELATIVE_STRENGTH_MIN:
+                    continue  # skip stocks lagging behind SPY
 
+                score = vol * abs(rel_strength)
                 if regime in ["bullish", "choppy"] and cur > prev:
                     score *= 1.5
 
@@ -495,18 +535,16 @@ def scan_symbols(regime):
         top = [s[0] for s in scored[:10]]
 
         if not top:
-            top = ["AMD", "SOFI", "F", "PLTR", "BAC"]
-            print(f"Scanner empty — using fallback: {top}")
+            print("Scanner returned empty after filters")
+            return None  # retry rather than use fallback immediately
 
         print(f"Watchlist ({regime}): {top}")
         notify(f"Market: {regime.upper()} | Scanning: {', '.join(top)}")
         return top
 
     except Exception as e:
-        print(f"Scanner failed: {e}")
-        fallback = ["AMD", "SOFI", "F", "PLTR", "BAC"]
-        notify(f"Scanner failed — using fallback: {', '.join(fallback)}")
-        return fallback
+        print(f"Scanner exception: {e}")
+        return None  # retry on any exception
 
 # =========================
 # GET BARS
@@ -540,7 +578,6 @@ def get_orb_levels(df):
     return orb_bars["high"].max(), orb_bars["low"].min()
 
 def is_orb_range_valid(high, low, current_price):
-    """ORB range must be at least 0.5% of price — filters out flat open days."""
     orb_range = (high - low) / current_price
     if orb_range < MIN_ORB_RANGE_PCT:
         return False, f"ORB range too tight ({orb_range:.3%})"
@@ -548,12 +585,12 @@ def is_orb_range_valid(high, low, current_price):
 
 # =========================
 # VOLUME CONFIRMATION
-# Skipped before 10:30 AM — early volume is unreliable
+# Skipped before 10:30 AM
 # =========================
 
 def has_volume_confirmation(df):
     if is_early_session():
-        return True  # skip volume check before 10:30 AM
+        return True
     return df["volume"].iloc[-1] > df["volume"].mean() * VOLUME_MULTIPLIER
 
 # =========================
@@ -561,7 +598,6 @@ def has_volume_confirmation(df):
 # =========================
 
 def get_position_qty(price, equity):
-    """Risk 20% of account per trade, adjusted for stock price."""
     risk_per_trade = equity * 0.20
     qty            = max(1, int(risk_per_trade / price))
     return min(qty, MAX_QTY)
@@ -613,7 +649,7 @@ def get_trades_allowed_today(week_trade_count, trades_today):
     trades_left = MAX_DAY_TRADES - week_trade_count
     if trades_left <= 0:
         return 0
-    if weekday >= 3:  # Thu/Fri — use all remaining
+    if weekday >= 3:
         return trades_left
     return min(trades_left, max(1, trades_left - (4 - weekday)))
 
@@ -625,6 +661,7 @@ init_log()
 
 positions        = {}
 watchlist        = []
+scanner_failed   = False   # tracks if scanner needs retry
 regime           = "choppy"
 last_date        = None
 last_week        = None
@@ -639,9 +676,9 @@ equity           = 250.0
 
 notify(
     f"Bot started — PDT margin account\n"
-    f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | "
-    f"Ratio: 2:1 | Max: 3 trades/week\n"
-    f"ORB valid until: {ORB_VALID_UNTIL_HOUR}:{ORB_VALID_UNTIL_MINUTE:02d} ET"
+    f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | Ratio: 2:1\n"
+    f"Max: 3 trades/week | ORB valid until "
+    f"{ORB_VALID_UNTIL_HOUR}:{ORB_VALID_UNTIL_MINUTE:02d} ET"
 )
 
 # =========================
@@ -660,12 +697,13 @@ while True:
             week_trade_count = 0
             report_sent      = False
             last_week        = cur_week
-            print(f"New week — reset")
+            print("New week — reset")
 
         # ── NEW DAY RESET ──
         if last_date != today:
             positions       = {}
             watchlist       = []
+            scanner_failed  = False
             regime          = "choppy"
             trades_today    = 0
             eod_sent        = False
@@ -677,7 +715,7 @@ while True:
             notify(
                 f"New day: {today}\n"
                 f"QTY: {qty} | Equity: ${equity:.2f}\n"
-                f"Target trades today: {allowed} | "
+                f"Target: {allowed} trade(s) | "
                 f"Week: {week_trade_count}/3"
             )
             check_go_live_recommendation()
@@ -702,13 +740,39 @@ while True:
             )
             eod_sent = True
 
-        # ── BUILD WATCHLIST after ORB window ──
+        # ── BUILD WATCHLIST at 9:45 AM ──
         if not watchlist and is_orb_window_complete():
-            regime    = get_market_regime()
-            watchlist = scan_symbols(regime)
+            regime = get_market_regime()
+            result = scan_symbols(regime)
+            if result is None:
+                # Data not ready yet — will retry at 9:50 AM
+                scanner_failed = True
+                print("Scanner returned None — will retry at 9:50 AM")
+            else:
+                watchlist      = result
+                scanner_failed = False
+
+        # ── SCANNER RETRY at 9:50 AM ──
+        if (scanner_failed and not watchlist
+                and is_scanner_retry_time()):
+            print("Retrying scanner at 9:50 AM...")
+            regime = get_market_regime()
+            result = scan_symbols(regime)
+            if result is not None:
+                watchlist      = result
+                scanner_failed = False
+                print(f"Scanner retry succeeded: {watchlist}")
+            else:
+                # Final fallback — use hardcoded list
+                watchlist = FALLBACK_SYMBOLS
+                notify(
+                    f"Scanner failed twice — using fallback: "
+                    f"{', '.join(watchlist)}"
+                )
+                scanner_failed = False
 
         if not watchlist:
-            print(f"Waiting for ORB — {now_et.strftime('%H:%M ET')}")
+            print(f"Waiting for scanner — {now_et.strftime('%H:%M ET')}")
             time.sleep(60)
             continue
 
@@ -721,23 +785,23 @@ while True:
 
         # ── WEEKLY CIRCUIT BREAKER ──
         if weekly_pnl <= -MAX_WEEKLY_LOSS:
-            no_trade_reason = f"Weekly loss limit hit (${weekly_pnl:.2f})"
-            print(no_trade_reason)
+            no_trade_reason = f"Weekly loss limit (${weekly_pnl:.2f})"
+            print(f"Weekly loss limit hit — sitting out")
             time.sleep(60)
             continue
 
-        # ── THURSDAY REMINDER if behind on trades ──
+        # ── THURSDAY REMINDER ──
         if (now_et.weekday() == 3 and now_et.hour == 9
                 and now_et.minute == 45 and week_trade_count == 0):
             notify(
                 f"⚠️ Thursday — 0 trades this week\n"
-                f"Bot will attempt all 3 trades today/tomorrow"
+                f"Attempting all 3 trades today/tomorrow"
             )
 
         pdt_used      = get_day_trade_count()
         allowed_today = get_trades_allowed_today(week_trade_count, trades_today)
 
-        # ── FORCE EXIT NEAR CLOSE (3:55 PM ET) ──
+        # ── FORCE EXIT NEAR CLOSE ──
         if is_near_market_close():
             for sym, pos in list(positions.items()):
                 try:
@@ -825,18 +889,19 @@ while True:
                       and len(positions) < MAX_POSITIONS
                       and has_volume_confirmation(df)):
 
-                    # ORB range validity check
-                    valid_orb, skip_reason = is_orb_range_valid(high, low, current_price)
+                    # ORB range check
+                    valid_orb, skip_reason = is_orb_range_valid(
+                        high, low, current_price
+                    )
                     if not valid_orb:
                         log_skip(symbol, skip_reason)
                         no_trade_reason = skip_reason
                         continue
 
-                    # Dynamic QTY based on stock price
                     trade_qty      = get_position_qty(current_price, equity)
                     tp_amt, sl_amt = get_tp_sl(current_price, trade_qty)
 
-                    # Bullish or choppy — longs only
+                    # Longs only (bullish or choppy)
                     if (regime in ["bullish", "choppy"]
                             and current_price > high * (1 + ORB_BUFFER)):
                         place_order(symbol, OrderSide.BUY, trade_qty)
@@ -847,22 +912,22 @@ while True:
                             "sl":    sl_amt,
                             "qty":   trade_qty
                         }
-                        pdt_used      += 1
-                        allowed_today -= 1
-                        no_trade_reason = ""
+                        pdt_used        += 1
+                        allowed_today   -= 1
+                        no_trade_reason  = ""
                         notify(
                             f"📈 BUY {symbol} x{trade_qty} "
                             f"@ ${current_price:.2f}\n"
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
                             f"Week: {week_trade_count+1}/3 | "
-                            f"PDT used: {pdt_used}/3"
+                            f"PDT: {pdt_used}/3"
                         )
                     else:
-                        # Log why no entry was taken
                         if regime == "bearish":
-                            reason = "Bearish regime — longs disabled"
+                            reason = "Bearish — longs disabled"
                         elif current_price <= high * (1 + ORB_BUFFER):
-                            reason = f"Price ${current_price:.2f} below ORB high ${high:.2f}"
+                            reason = (f"Price ${current_price:.2f} "
+                                      f"below ORB high ${high:.2f}")
                         else:
                             reason = "No setup"
                         log_skip(symbol, reason)
