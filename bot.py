@@ -771,12 +771,14 @@ while True:
         cur_week = now_et.isocalendar()[1]
 
         # ── NEW WEEK RESET ──
-        if last_week != cur_week:
+        # Only reset if last_week was already set (not first boot)
+        # Prevents wiping recovered state on startup
+        if last_week is not None and last_week != cur_week:
             weekly_pnl       = 0.0
             week_trade_count = 0
             report_sent      = False
-            last_week        = cur_week
             print("New week — reset")
+        last_week = cur_week
 
         # ── NEW DAY RESET ──
         if last_date != today:
