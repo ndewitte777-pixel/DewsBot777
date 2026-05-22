@@ -451,6 +451,8 @@ def get_spy_daily_change():
 def get_top_sectors():
     try:
         etf_list = list(SECTOR_ETFS.values())
+        if not etf_list:
+            return ["Technology", "ConsumerDisc", "Financials"]
         req      = StockSnapshotRequest(symbol_or_symbols=etf_list)
         snaps    = data_client.get_stock_snapshot(req)
         scored   = []
@@ -491,6 +493,10 @@ def scan_symbols(regime):
         for sector in top_sectors:
             candidates.extend(SECTOR_STOCKS.get(sector, []))
         candidates = list(set(candidates))
+
+        if not candidates:
+            print("No candidates from sectors — using fallback")
+            return None
 
         req   = StockSnapshotRequest(symbol_or_symbols=candidates)
         snaps = data_client.get_stock_snapshot(req)
@@ -615,8 +621,15 @@ def get_position_qty(price, equity):
 # =========================
 
 def get_tp_sl(entry_price, qty):
-    tp = max(TAKE_PROFIT, entry_price * MIN_TP_PCT) * qty
-    sl = max(STOP_LOSS,   entry_price * MIN_SL_PCT) * qty
+    # Per-share TP/SL capped at 2% and 1% of stock price
+    # Prevents cheap stocks getting unreachable $2.00+ per share targets
+    per_share_tp = min(TAKE_PROFIT, entry_price * 0.02)
+    per_share_sl = min(STOP_LOSS,   entry_price * 0.01)
+    # Apply floors so we still have meaningful targets
+    per_share_tp = max(per_share_tp, entry_price * MIN_TP_PCT)
+    per_share_sl = max(per_share_sl, entry_price * MIN_SL_PCT)
+    tp = per_share_tp * qty
+    sl = per_share_sl * qty
     return tp, sl
 
 # =========================
