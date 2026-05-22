@@ -26,13 +26,13 @@ STOP_LOSS       = 1.00   # $1.00 stop
 MAX_WEEKLY_LOSS = 6.00   # weekly circuit breaker
 MAX_DAY_TRADES  = 3      # PDT limit
 MAX_POSITIONS   = 1      # one position at a time
-MIN_PRICE       = 5      # skip stocks below this
-MAX_PRICE       = 49     # skip stocks above this (strict — keeps BAC out)
+MIN_PRICE       = 8      # skip stocks below this — sweet spot range
+MAX_PRICE       = 30     # skip stocks above this — more % movement per day
 MAX_QTY         = 10     # hard cap regardless of account size
 BASE_QTY        = 2      # starting shares
-QTY_PER_50      = 1      # +1 share per $50 account growth above $250
+QTY_PER_50      = 2      # +2 shares per $50 growth (was 1 — more aggressive)
 MIN_TP_PCT      = 0.004  # minimum 0.4% for TP floor
-MIN_SL_PCT      = 0.002  # minimum 0.2% for SL floor
+MIN_SL_PCT      = 0.005  # minimum 0.5% stop — was 0.2%, too tight on cheap stocks
 
 # Entry filters
 REGIME_THRESHOLD      = 0.001  # SPY needs 0.1% move to call bullish
@@ -98,8 +98,8 @@ SECTOR_STOCKS = {
     "ConsumerStap": ["WMT", "KO"],
 }
 
-# Fallback watchlist — all verified under $49, no BAC
-FALLBACK_SYMBOLS = ["AMD", "SOFI", "F", "PLTR", "NIO", "SNAP", "RIVN"]
+# Fallback watchlist — all in $8-$30 range, good intraday movers
+FALLBACK_SYMBOLS = ["PLTR", "SOFI", "AMD", "F", "SNAP"]
 
 # =========================
 # INIT CLIENTS
@@ -608,6 +608,20 @@ def has_volume_confirmation(df):
     return df["volume"].iloc[-1] > df["volume"].mean() * VOLUME_MULTIPLIER
 
 # =========================
+# MOMENTUM FILTER
+# Last 3 closes must average higher than the 3 before them
+# Confirms stock is actually moving in the right direction
+# =========================
+
+def has_momentum(df):
+    if len(df) < 6:
+        return True  # not enough bars yet — don't block early trades
+    recent      = df["close"].iloc[-6:]
+    first_half  = recent.iloc[:3].mean()
+    second_half = recent.iloc[3:].mean()
+    return second_half > first_half
+
+# =========================
 # DYNAMIC QTY per stock price
 # =========================
 
@@ -981,6 +995,13 @@ while True:
 
                     trade_qty      = get_position_qty(current_price, equity)
                     tp_amt, sl_amt = get_tp_sl(current_price, trade_qty)
+
+                    # Momentum check — stock must be trending up
+                    if not has_momentum(df):
+                        log_skip(symbol, "No momentum — price not trending up")
+                        if not no_trade_reason:
+                            no_trade_reason = "No momentum"
+                        continue
 
                     # Longs only (bullish or choppy)
                     if (regime in ["bullish", "choppy"]
