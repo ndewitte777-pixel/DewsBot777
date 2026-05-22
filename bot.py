@@ -683,17 +683,17 @@ def recover_state():
     """
     Reads trade_log.csv to recover week_trade_count and weekly_pnl
     so a mid-week restart doesn't think it has 3 fresh trades.
-    Also recovers trades_today for the current day.
+    Also checks WEEK_TRADE_OVERRIDE env var for manual correction.
     """
     try:
-        all_trades  = read_all_trades()
-        now         = datetime.now(ET)
-        cur_week    = now.isocalendar()[1]
-        cur_year    = now.year
-        today_str   = now.strftime("%Y-%m-%d")
+        all_trades   = read_all_trades()
+        now          = datetime.now(ET)
+        cur_week     = now.isocalendar()[1]
+        cur_year     = now.year
+        today_str    = now.strftime("%Y-%m-%d")
 
-        week_trades = [t for t in all_trades
-                       if _trade_week(t) == (cur_year, cur_week)]
+        week_trades  = [t for t in all_trades
+                        if _trade_week(t) == (cur_year, cur_week)]
         today_trades = [t for t in week_trades
                         if t["date"].startswith(today_str)]
 
@@ -701,13 +701,26 @@ def recover_state():
         weekly_pnl       = sum(float(t["pnl"]) for t in week_trades)
         trades_today     = len(today_trades)
 
-        if week_trade_count > 0:
+        # Manual override — set WEEK_TRADE_OVERRIDE in Railway Variables
+        # to correct the count when log is missing trades
+        # Remove the variable once the log is accurate
+        override = os.environ.get("WEEK_TRADE_OVERRIDE")
+        if override is not None:
+            override_count   = int(override)
+            weekly_pnl       = max(weekly_pnl, 0.0)
+            week_trade_count = max(week_trade_count, override_count)
+            print(
+                f"WEEK_TRADE_OVERRIDE active — "
+                f"using {week_trade_count}/3 trades"
+            )
+        elif week_trade_count > 0:
             print(
                 f"State recovered from log — "
                 f"week trades: {week_trade_count}/3 | "
                 f"week P&L: ${weekly_pnl:.2f} | "
                 f"trades today: {trades_today}"
             )
+
         return week_trade_count, weekly_pnl, trades_today
 
     except Exception as e:
