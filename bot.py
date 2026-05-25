@@ -530,15 +530,17 @@ def scan_symbols(regime):
                     print(f"Skipping {sym} — earnings gap")
                     continue
 
-                # Relative strength filter — must outperform SPY
+                # Relative strength vs SPY — used for scoring not filtering
                 stock_change = (cur - prev) / prev if prev else 0
                 rel_strength = stock_change - spy_change
-                if regime in ["bullish", "choppy"] and rel_strength < RELATIVE_STRENGTH_MIN:
-                    continue  # skip stocks lagging behind SPY
 
-                score = vol * abs(rel_strength)
+                # Score by volume and relative strength
+                # No hard filter — let all stocks through, rank by quality
+                score = vol * (abs(rel_strength) + 0.001)
                 if regime in ["bullish", "choppy"] and cur > prev:
                     score *= 1.5
+                if rel_strength > 0:
+                    score *= 1.2  # slight boost for outperforming SPY
 
                 scored.append((sym, score))
             except Exception as e:
@@ -549,8 +551,29 @@ def scan_symbols(regime):
         top = [s[0] for s in scored[:10]]
 
         if not top:
-            print("Scanner returned empty after filters")
-            return None  # retry rather than use fallback immediately
+            # All stocks filtered out — relax price filter and try again
+            print("Scanner empty after filters — relaxing price filter")
+            scored_relaxed = []
+            for sym, snap in snaps.items():
+                try:
+                    if not snap or not snap.daily_bar:
+                        continue
+                    cur = snap.daily_bar.close
+                    vol = snap.daily_bar.volume
+                    prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
+                    # Wider price range as fallback
+                    if cur < 5 or cur > 50:
+                        continue
+                    score = vol * abs((cur - prev) / prev) if prev else vol
+                    scored_relaxed.append((sym, score))
+                except Exception:
+                    continue
+            scored_relaxed.sort(key=lambda x: x[1], reverse=True)
+            top = [s[0] for s in scored_relaxed[:10]]
+
+        if not top:
+            print("Scanner returned empty after relaxed filter too")
+            return None
 
         print(f"Watchlist ({regime}): {top}")
         notify(f"Market: {regime.upper()} | Scanning: {', '.join(top)}")
@@ -716,17 +739,12 @@ def recover_state():
         trades_today     = len(today_trades)
 
         # Manual override — set WEEK_TRADE_OVERRIDE in Railway Variables
-        # to correct the count when log is missing trades
-        # Remove the variable once the log is accurate
+        # to correct count when log is missing trades (remove after use)
         override = os.environ.get("WEEK_TRADE_OVERRIDE")
         if override is not None:
             override_count   = int(override)
-            weekly_pnl       = max(weekly_pnl, 0.0)
             week_trade_count = max(week_trade_count, override_count)
-            print(
-                f"WEEK_TRADE_OVERRIDE active — "
-                f"using {week_trade_count}/3 trades"
-            )
+            print(f"WEEK_TRADE_OVERRIDE active — using {week_trade_count}/3")
         elif week_trade_count > 0:
             print(
                 f"State recovered from log — "
@@ -836,20 +854,19 @@ while True:
             eod_sent = True
 
         # ── BUILD WATCHLIST at 9:45 AM ──
-        if not watchlist and is_orb_window_complete():
+        if not watchlist and is_orb_window_complete() and not scanner_failed:
             regime = get_market_regime()
             result = scan_symbols(regime)
             if result is None:
-                # Data not ready yet — will retry at 9:50 AM
+                # Data not ready — retry once at 9:50 AM only
                 scanner_failed = True
-                print("Scanner returned None — will retry at 9:50 AM")
+                print("Scanner returned None — will retry once at 9:50 AM")
             else:
                 watchlist      = result
                 scanner_failed = False
 
-        # ── SCANNER RETRY at 9:50 AM ──
-        if (scanner_failed and not watchlist
-                and is_scanner_retry_time()):
+        # ── SCANNER RETRY — one time only at 9:50 AM ──
+        if (scanner_failed and not watchlist and is_scanner_retry_time()):
             print("Retrying scanner at 9:50 AM...")
             regime = get_market_regime()
             result = scan_symbols(regime)
@@ -858,13 +875,13 @@ while True:
                 scanner_failed = False
                 print(f"Scanner retry succeeded: {watchlist}")
             else:
-                # Final fallback — use hardcoded list
-                watchlist = FALLBACK_SYMBOLS
+                # Final fallback — stops all further retries
+                watchlist      = FALLBACK_SYMBOLS
+                scanner_failed = False  # prevents any further retries
                 notify(
-                    f"Scanner failed twice — using fallback: "
+                    f"Scanner failed — using fallback watchlist: "
                     f"{', '.join(watchlist)}"
                 )
-                scanner_failed = False
 
         if not watchlist:
             print(f"Waiting for scanner — {now_et.strftime('%H:%M ET')}")
