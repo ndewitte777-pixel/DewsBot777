@@ -21,13 +21,13 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-TAKE_PROFIT     = 2.00   # $2.00 target — 2:1 ratio
-STOP_LOSS       = 1.00   # $1.00 stop
-MAX_WEEKLY_LOSS = 6.00   # weekly circuit breaker
+TAKE_PROFIT     = 1.50   # $1.50 target — easier to hit on $10-$25 stocks
+STOP_LOSS       = 0.75   # $0.75 stop — maintains 2:1 ratio
+MAX_WEEKLY_LOSS = 4.50   # circuit breaker — 3 max losses at $0.75 each + buffer
 MAX_DAY_TRADES  = 3      # PDT limit
 MAX_POSITIONS   = 1      # one position at a time
-MIN_PRICE       = 8      # skip stocks below this — sweet spot range
-MAX_PRICE       = 30     # skip stocks above this — more % movement per day
+MIN_PRICE       = 10     # no penny stocks — too noisy
+MAX_PRICE       = 25     # sweet spot — stocks move enough % to hit TP
 MAX_QTY         = 10     # hard cap regardless of account size
 BASE_QTY        = 2      # starting shares
 QTY_PER_50      = 2      # +2 shares per $50 growth (was 1 — more aggressive)
@@ -86,20 +86,21 @@ SECTOR_ETFS = {
 }
 
 SECTOR_STOCKS = {
-    "Technology":   ["AMD", "INTC", "MU", "PLTR", "SOFI", "SNAP"],
-    "Energy":       ["OXY", "SLB", "HAL", "DVN"],
-    "Financials":   ["SOFI", "COIN", "NU", "HOOD"],
-    "Healthcare":   ["PFE", "MRNA", "NVAX", "SAVA"],
-    "ConsumerDisc": ["F", "GM", "RIVN", "NIO", "LCID"],
-    "Industrials":  ["GE", "AAL", "UAL", "DAL"],
-    "Materials":    ["FCX", "AA", "CLF", "MT"],
-    "Utilities":    ["NEE", "SO", "PCG"],
-    "RealEstate":   ["SPG", "OPEN"],
-    "ConsumerStap": ["WMT", "KO"],
+    # All stocks verified in $10-$25 range — good intraday movers
+    "Technology":   ["SOFI", "SNAP", "PLTR", "INTC", "BB"],
+    "Energy":       ["HAL", "SLB", "OXY", "DVN"],
+    "Financials":   ["SOFI", "NU", "HOOD", "UWMC"],
+    "Healthcare":   ["PFE", "NVAX", "SAVA", "ACAD"],
+    "ConsumerDisc": ["F", "GM", "RIVN", "LCID"],
+    "Industrials":  ["AAL", "UAL", "DAL", "SAVE"],
+    "Materials":    ["CLF", "MT", "AA"],
+    "Utilities":    ["PCG", "NIO"],
+    "RealEstate":   ["OPEN", "RKT"],
+    "ConsumerStap": ["SAVE", "GO"],
 }
 
-# Fallback watchlist — all in $8-$30 range, good intraday movers
-FALLBACK_SYMBOLS = ["PLTR", "SOFI", "AMD", "F", "SNAP"]
+# Fallback watchlist — all verified $10-$25 range, good intraday movers
+FALLBACK_SYMBOLS = ["SOFI", "PLTR", "F", "SNAP", "HAL", "CLF", "AAL"]
 
 # =========================
 # INIT CLIENTS
@@ -658,10 +659,11 @@ def get_position_qty(price, equity):
 # =========================
 
 def get_tp_sl(entry_price, qty):
-    # Per-share TP/SL capped at 2% and 1% of stock price
-    # Prevents cheap stocks getting unreachable $2.00+ per share targets
-    per_share_tp = min(TAKE_PROFIT, entry_price * 0.02)
-    per_share_sl = min(STOP_LOSS,   entry_price * 0.01)
+    # Per-share TP/SL capped at 3% and 1.5% of stock price
+    # $15 stock: TP = min($1.50, $0.45) = $0.45/share × qty
+    # Keeps targets realistic for $10-$25 stocks
+    per_share_tp = min(TAKE_PROFIT, entry_price * 0.03)
+    per_share_sl = min(STOP_LOSS,   entry_price * 0.015)
     # Apply floors so we still have meaningful targets
     per_share_tp = max(per_share_tp, entry_price * MIN_TP_PCT)
     per_share_sl = max(per_share_sl, entry_price * MIN_SL_PCT)
