@@ -3,7 +3,12 @@ import requests
 import os
 import csv
 import pytz
-import feedparser
+try:
+    import feedparser
+    FEEDPARSER_AVAILABLE = True
+except ImportError:
+    FEEDPARSER_AVAILABLE = False
+    print("feedparser not installed — news filter disabled")
 from datetime import datetime, timedelta
 
 from alpaca.trading.client import TradingClient
@@ -25,8 +30,8 @@ PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
 TAKE_PROFIT      = 1.50
 STOP_LOSS        = 0.75
-TRAIL_ACTIVATION = 0.50
-TRAIL_DISTANCE   = 0.30
+TRAIL_ACTIVATION = 0.25  # was $0.50 — activates sooner to catch reversals
+TRAIL_DISTANCE   = 0.20  # was $0.30 — tighter trail
 MAX_WEEKLY_LOSS  = 4.50
 MAX_DAY_TRADES   = 3
 MAX_POSITIONS    = 1
@@ -606,6 +611,8 @@ def has_major_news(symbol):
     Skips if earnings, FDA, merger, lawsuit etc. found.
     Returns True if stock should be skipped.
     """
+    if not FEEDPARSER_AVAILABLE:
+        return False  # skip news check if feedparser not installed
     try:
         url  = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
         feed = feedparser.parse(url)
@@ -895,16 +902,16 @@ def should_smart_exit(df, pos, current_price, entry_time):
     vwap = get_vwap(df)
     if is_volume_spike(df) and gain > 0:
         return True, f"Volume spike — blow-off top +${gain:.2f}"
-    if current_price < vwap and gain > 0.30*qty:
+    if current_price < vwap and gain > 0.10*qty:
         return True, f"Below VWAP +${gain:.2f}"
-    if is_momentum_dying(df) and gain > pos["tp"]*0.40:
+    if is_momentum_dying(df) and gain > pos["tp"]*0.20:
         return True, f"Momentum dying +${gain:.2f}"
-    if is_volume_drying_up(df) and gain > 0.20*qty:
+    if is_volume_drying_up(df) and gain > 0.10*qty:
         return True, f"Volume drying up +${gain:.2f}"
-    if is_uptrend_broken(df) and gain > pos["tp"]*0.30:
+    if is_uptrend_broken(df) and gain > pos["tp"]*0.15:
         return True, f"Uptrend broken +${gain:.2f}"
     minutes_held = (datetime.now(ET)-entry_time).seconds/60
-    if minutes_held > 60 and gain < pos["tp"]*0.25:
+    if minutes_held > 45 and gain < pos["tp"]*0.20:
         return True, f"Stale {minutes_held:.0f}min +${gain:.2f}"
     return False, ""
 
