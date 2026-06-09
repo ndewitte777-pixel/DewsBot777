@@ -897,25 +897,42 @@ def should_smart_exit(df, pos, current_price, entry_time):
     qty  = pos["qty"]
     gain = ((current_price-pos["entry"])*qty if pos["side"]=="LONG"
             else (pos["entry"]-current_price)*qty)
-    if gain <= 0:
-        return False, ""
+    # Always check momentum/uptrend signals regardless of gain
+    # Only skip profit-protection exits when losing
     vwap = get_vwap(df)
-    if is_volume_spike(df) and gain > 0:
-        return True, f"Volume spike — blow-off top +${gain:.2f}"
-    if current_price < vwap and gain > 0.10*qty:
-        return True, f"Below VWAP +${gain:.2f}"
-    if is_momentum_dying(df) and gain > pos["tp"]*0.20:
-        return True, f"Momentum dying +${gain:.2f}"
-    if is_volume_drying_up(df) and gain > 0.10*qty:
-        return True, f"Volume drying up +${gain:.2f}"
-    if is_uptrend_broken(df) and gain > pos["tp"]*0.15:
-        return True, f"Uptrend broken +${gain:.2f}"
-    minutes_held = (datetime.now(ET)-entry_time).seconds/60
-    if minutes_held > 45 and gain < pos["tp"]*0.20:
-        return True, f"Stale {minutes_held:.0f}min +${gain:.2f}"
-    return False, ""
+    # --- PROFIT PROTECTION exits (only when winning) ---
+    if gain > 0:
+        if is_volume_spike(df):
+            return True, f"Volume spike — blow-off top +${gain:.2f}"
+        if current_price < vwap and gain > 0.10*qty:
+            return True, f"Below VWAP +${gain:.2f}"
+        if is_momentum_dying(df) and gain > pos["tp"]*0.20:
+            return True, f"Momentum dying +${gain:.2f}"
+        if is_volume_drying_up(df) and gain > 0.10*qty:
+            return True, f"Volume drying up +${gain:.2f}"
+        if is_uptrend_broken(df) and gain > pos["tp"]*0.15:
+            return True, f"Uptrend broken +${gain:.2f}"
 
-def update_trailing_stop(pos, current_price):
+    # --- LOSS LIMITING exits (fire even when losing) ---
+    # If stock was up and is now coming back down fast — exit early
+    peak_price = pos.get("peak_price", pos["entry"])
+    peak_gain  = (peak_price - pos["entry"]) * qty
+    drawdown   = peak_gain - gain  # how much we've given back from peak
+
+    # If we gave back more than 50% of the peak gain — exit to protect capital
+    if peak_gain > 0.20*qty and drawdown > peak_gain * 0.50:
+        return True, f"Peak giveback {drawdown:.2f} from +{peak_gain:.2f}"
+
+    # If momentum is dying AND we are losing — don't wait for SL
+    if is_momentum_dying(df) and gain < 0 and abs(gain) > 0.10*qty:
+        return True, f"Momentum dying in loss ${gain:.2f}"
+
+    # Stale trade check — works regardless of gain/loss
+    minutes_held = (datetime.now(ET)-entry_time).seconds/60
+    if minutes_held > 45 and abs(gain) < pos["tp"]*0.20 and gain < 0:
+        return True, f"Stale losing trade {minutes_held:.0f}min ${gain:.2f}"
+
+    return False, ""
     qty  = pos["qty"]
     gain = ((current_price-pos["entry"])*qty if pos["side"]=="LONG"
             else (pos["entry"]-current_price)*qty)
