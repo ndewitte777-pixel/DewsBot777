@@ -933,16 +933,21 @@ def should_smart_exit(df, pos, current_price, entry_time):
         return True, f"Stale losing trade {minutes_held:.0f}min ${gain:.2f}"
 
     return False, ""
+
+def update_trailing_stop(pos, current_price):
+    """Moves trailing stop up as price rises. Locks in profit."""
     qty  = pos["qty"]
-    gain = ((current_price-pos["entry"])*qty if pos["side"]=="LONG"
-            else (pos["entry"]-current_price)*qty)
+    gain = ((current_price - pos["entry"]) * qty
+            if pos["side"] == "LONG"
+            else (pos["entry"] - current_price) * qty)
     if gain < TRAIL_ACTIVATION:
         return pos
     if pos["side"] == "LONG":
-        peak = max(pos.get("peak_price",pos["entry"]), current_price)
+        peak = max(pos.get("peak_price", pos["entry"]), current_price)
+        trail_dist = pos.get("trail_distance", TRAIL_DISTANCE)
         pos["peak_price"]  = peak
         pos["trail_price"] = max(
-            pos.get("trail_price",0), peak-TRAIL_DISTANCE
+            pos.get("trail_price", 0), peak - trail_dist
         )
     return pos
 
