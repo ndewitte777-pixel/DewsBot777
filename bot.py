@@ -37,7 +37,7 @@ MAX_DAY_TRADES   = 3
 MAX_POSITIONS    = 1
 MIN_PRICE        = 10
 MAX_PRICE        = 25
-MAX_QTY          = 10
+MAX_QTY          = 4      # hard cap — $25×4=$100 = 40% of $250
 BASE_QTY         = 2
 QTY_PER_50       = 2
 POSITION_PCT     = 0.35
@@ -89,16 +89,16 @@ SECTOR_ETFS = {
 
 # Verified $10-$25 range June 2026
 SECTOR_STOCKS = {
-    "Technology":   ["SOFI", "SNAP", "INTC"],
-    "Energy":       ["OXY", "SLB", "DVN"],
-    "Financials":   ["SOFI", "NU", "HOOD"],
-    "Healthcare":   ["PFE", "NVAX"],
-    "ConsumerDisc": ["F", "GM", "RIVN"],
-    "Industrials":  ["AAL", "UAL"],
-    "Materials":    ["CLF", "AA"],
-    "Utilities":    ["PCG"],
-    "RealEstate":   ["OPEN"],
-    "ConsumerStap": ["GO"],
+    "Technology":   ["SOFI", "SNAP", "INTC", "BB", "ERIC", "NOK"],
+    "Energy":       ["OXY", "SLB", "DVN", "HAL", "MRO", "CVX"],
+    "Financials":   ["SOFI", "NU", "HOOD", "BAC", "C", "WFC"],
+    "Healthcare":   ["PFE", "NVAX", "MRNA", "CVS", "WBA"],
+    "ConsumerDisc": ["F", "GM", "RIVN", "NIO", "PARA", "WBD"],
+    "Industrials":  ["AAL", "UAL", "DAL", "GE"],
+    "Materials":    ["CLF", "AA", "FCX", "MT", "X"],
+    "Utilities":    ["PCG", "NEE", "SO", "EXC"],
+    "RealEstate":   ["OPEN", "RKT", "RDFN"],
+    "ConsumerStap": ["GO", "KR", "SFM"],
 }
 
 # Symbol → sector ETF map for sector strength filter
@@ -495,6 +495,10 @@ def is_scanner_retry_time():
     now = datetime.now(ET)
     return now.hour == 9 and now.minute == SCANNER_RETRY_MINUTE
 
+def is_scanner_second_retry_time():
+    now = datetime.now(ET)
+    return now.hour == 10 and now.minute == 0
+
 def is_premarket_scan_time():
     """9:00 AM — run pre-market gap scan."""
     now = datetime.now(ET)
@@ -696,9 +700,7 @@ def scan_symbols(regime, priority_symbols=None):
         snaps = data_client.get_stock_snapshot(req)
 
         prev_count = sum(1 for s in snaps.values() if s and s.prev_daily_bar)
-        if len(snaps) > 0 and prev_count/len(snaps) < 0.5:
-            print(f"Only {prev_count}/{len(snaps)} have prev bar — retry")
-            return None
+        print(f"Prev bar: {prev_count}/{len(snaps)} stocks ready")
 
         scored = []
         for sym, snap in snaps.items():
@@ -1163,16 +1165,32 @@ while True:
                 watchlist      = result
                 scanner_failed = False
 
-        # ── SCANNER RETRY at 9:50 AM ──
+        # -- SCANNER RETRY at 9:50 AM --
         if scanner_failed and not watchlist and is_scanner_retry_time():
+            print("Retrying scanner at 9:50 AM...")
             regime = get_market_regime()
             result = scan_symbols(regime, premarket_gaps)
             if result is not None:
-                watchlist = result
+                watchlist      = result
+                scanner_failed = False
+                print(f"9:50 retry succeeded: {watchlist}")
+            # If still None, wait for 10:00 AM retry below
+
+        # -- SCANNER SECOND RETRY at 10:00 AM --
+        if scanner_failed and not watchlist and is_scanner_second_retry_time():
+            print("Final scanner retry at 10:00 AM...")
+            regime = get_market_regime()
+            result = scan_symbols(regime, premarket_gaps)
+            if result is not None:
+                watchlist      = result
+                scanner_failed = False
+                print(f"10 AM retry succeeded: {watchlist}")
             else:
-                watchlist = FALLBACK_SYMBOLS
-                notify(f"Scanner failed — fallback: {', '.join(watchlist)}")
-            scanner_failed = False
+                # All retries exhausted -- use fallback
+                watchlist      = FALLBACK_SYMBOLS
+                scanner_failed = False
+                notify(f"Scanner failed 3x -- using fallback: "
+                       f"{', '.join(watchlist)}")
 
         if not watchlist:
             print(f"Waiting for scanner — {now_et.strftime('%H:%M ET')}")
