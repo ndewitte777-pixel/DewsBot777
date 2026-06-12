@@ -579,10 +579,10 @@ def scan_premarket_gaps():
         gap_stocks = []
         for sym, snap in snaps.items():
             try:
-                if not snap or not snap.daily_bar or not snap.prev_daily_bar:
+                if not snap or not snap.daily_bar or not getattr(snap, 'prev_daily_bar', None):
                     continue
                 cur_open   = snap.daily_bar.open
-                prev_close = snap.prev_daily_bar.close
+                prev_close = getattr(snap, 'prev_daily_bar', None).close
                 gap_pct    = (cur_open - prev_close) / prev_close
 
                 # Sweet spot: 2-5% gap up, not earnings spike
@@ -673,7 +673,7 @@ def get_top_sectors():
             if not snap or not snap.daily_bar:
                 continue
             cur  = snap.daily_bar.close
-            prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
+            prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
             pct  = (cur-prev)/prev if prev else 0
             scored.append((sector, pct))
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -699,7 +699,7 @@ def scan_symbols(regime, priority_symbols=None):
         req   = StockSnapshotRequest(symbol_or_symbols=candidates)
         snaps = data_client.get_stock_snapshot(req)
 
-        prev_count = sum(1 for s in snaps.values() if s and s.prev_daily_bar)
+        prev_count = sum(1 for s in snaps.values() if s and getattr(s, 'prev_daily_bar', None))
         print(f"Prev bar: {prev_count}/{len(snaps)} stocks ready")
 
         scored = []
@@ -710,7 +710,7 @@ def scan_symbols(regime, priority_symbols=None):
                 cur  = snap.daily_bar.close
                 op   = snap.daily_bar.open
                 vol  = snap.daily_bar.volume
-                prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
+                prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
                 if cur < 5 or cur > 60:
                     continue
                 if prev and abs((op-prev)/prev) > 0.05:
@@ -740,7 +740,7 @@ def scan_symbols(regime, priority_symbols=None):
                     if not snap or not snap.daily_bar:
                         continue
                     cur  = snap.daily_bar.close
-                    prev = snap.prev_daily_bar.close if snap.prev_daily_bar else cur
+                    prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
                     if 5 <= cur <= 60:
                         score = snap.daily_bar.volume * abs((cur-prev)/prev) if prev else 0
                         scored_r.append((sym,score))
