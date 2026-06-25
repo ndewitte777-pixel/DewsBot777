@@ -34,7 +34,7 @@ TRAIL_ACTIVATION = 0.25  # was $0.50 — activates sooner to catch reversals
 TRAIL_DISTANCE   = 0.20  # was $0.30 — tighter trail
 MAX_WEEKLY_LOSS  = 4.50
 MAX_TRADES_PER_DAY  = 3   # max trades per day (no weekly PDT limit anymore)
-MAX_POSITIONS       = 1
+MAX_POSITIONS       = 3   # up to 3 concurrent positions (was 1)
 MIN_PRICE        = 10
 MAX_PRICE        = 25
 MAX_QTY          = 4      # hard cap — $25×4=$100 = 40% of $250
@@ -63,6 +63,13 @@ MILESTONES = [260, 275, 300, 350, 500, 750, 1000]
 
 PAPER_START_DATE  = os.environ.get("PAPER_START_DATE", "2026-05-13")
 DATA_DIR          = os.environ.get("DATA_DIR", ".")
+
+# Kill switch — set TRADING_PAUSED=true in Railway to stop new entries
+# without redeploying. Open positions still close normally.
+TRADING_PAUSED = os.environ.get("TRADING_PAUSED", "false").lower() == "true"
+
+# Allow re-entry on a stock that already hit TP earlier the same day
+ALLOW_REENTRY = os.environ.get("ALLOW_REENTRY", "true").lower() == "true"
 LOG_FILE          = os.path.join(DATA_DIR, "trade_log.csv")
 SKIP_LOG_FILE     = os.path.join(DATA_DIR, "skip_log.csv")
 MILESTONE_FILE    = os.path.join(DATA_DIR, "milestones.txt")
@@ -985,7 +992,10 @@ def take_partial_profit(symbol, pos, current_price, regime):
 # =========================
 
 def get_position_qty(price, equity, pos_multiplier=1.0):
-    risk      = equity * POSITION_PCT * pos_multiplier
+    # Divide capital across max concurrent positions so they all fit.
+    # 35% / 3 positions = ~11.6% each, leaving buffer.
+    per_position_pct = POSITION_PCT / MAX_POSITIONS
+    risk      = equity * per_position_pct * pos_multiplier
     qty       = max(1, int(risk/price))
     return min(qty, MAX_QTY)
 
@@ -1076,13 +1086,17 @@ qty              = BASE_QTY
 equity           = 250.0
 entry_times      = {}
 partial_pnl_total = 0.0
+reentry_count    = {}   # tracks how many times each symbol traded today (for re-entry cap)
 
 notify(
     f"Bot started — NO PDT LIMIT (rule eliminated June 4 2026)\n"
     f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | "
     f"Trail: +${TRAIL_ACTIVATION}\n"
     f"Position: {int(POSITION_PCT*100)}% | "
-    f"Up to {MAX_TRADES_PER_DAY} trades/day\n"
+    f"Up to {MAX_TRADES_PER_DAY} trades/day | "
+    f"{MAX_POSITIONS} concurrent positions\n"
+    f"Re-entry: {'ON' if ALLOW_REENTRY else 'OFF'} | "
+    f"{'⏸️ TRADING PAUSED' if TRADING_PAUSED else '▶️ Active'}\n"
     f"Trades this week: {week_trade_count} | P&L: ${weekly_pnl:.2f}"
 )
 
@@ -1119,6 +1133,7 @@ while True:
             eod_sent          = False
             no_trade_reason   = ""
             partial_pnl_total = 0.0
+            reentry_count     = {}
             last_date         = today
             qty, equity       = get_dynamic_qty()
             allowed           = get_trades_allowed_today(week_trade_count, 0)
@@ -1246,6 +1261,7 @@ while True:
                     )
                     del positions[sym]
                     entry_times.pop(sym, None)
+                    pending_orders.discard(sym)
                 except Exception as e:
                     print(f"EOD close failed {sym}: {e}")
             time.sleep(60)
@@ -1290,6 +1306,7 @@ while True:
                             trades_today     += 1
                             del positions[symbol]
                             entry_times.pop(symbol, None)
+                            pending_orders.discard(symbol)
                         else:
                             positions[symbol] = new_pos
 
@@ -1309,6 +1326,7 @@ while True:
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
+                        pending_orders.discard(symbol)
 
                     # 3. Trailing stop
                     elif is_trailing_stop_hit(pos, current_price):
@@ -1327,6 +1345,7 @@ while True:
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
+                        pending_orders.discard(symbol)
 
                     else:
                         # 4. Smart exit signals
@@ -1351,6 +1370,7 @@ while True:
                             )
                             del positions[symbol]
                             entry_times.pop(symbol, None)
+                            pending_orders.discard(symbol)
 
                         # 5. Hard stop loss
                         elif gain <= -pos["sl"]:
@@ -1368,14 +1388,17 @@ while True:
                             )
                             del positions[symbol]
                             entry_times.pop(symbol, None)
+                            pending_orders.discard(symbol)
 
                 # ── LOOK FOR NEW ENTRY ──
-                elif (not is_after_no_entry_time()
+                elif (not TRADING_PAUSED
+                      and not is_after_no_entry_time()
                       and is_orb_window_complete()
                       and is_orb_still_valid()
                       and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
                       and symbol not in pending_orders
+                      and reentry_count.get(symbol, 0) < (2 if ALLOW_REENTRY else 1)
                       and has_volume_confirmation(df)
                       and has_momentum(df)):
 
@@ -1441,6 +1464,7 @@ while True:
                         entry_times[symbol] = now_et
                         # No PDT limit — buying power checked before order
                         allowed_today  -= 1
+                        reentry_count[symbol] = reentry_count.get(symbol, 0) + 1
                         no_trade_reason = ""
 
                         gap_tag = " 🌅GAP" if symbol in premarket_gaps else ""
