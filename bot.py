@@ -33,8 +33,8 @@ STOP_LOSS        = 0.75
 TRAIL_ACTIVATION = 0.25  # was $0.50 — activates sooner to catch reversals
 TRAIL_DISTANCE   = 0.20  # was $0.30 — tighter trail
 MAX_WEEKLY_LOSS  = 4.50
-MAX_DAY_TRADES   = 3
-MAX_POSITIONS    = 1
+MAX_TRADES_PER_DAY  = 3   # max trades per day (no weekly PDT limit anymore)
+MAX_POSITIONS       = 1
 MIN_PRICE        = 10
 MAX_PRICE        = 25
 MAX_QTY          = 4      # hard cap — $25×4=$100 = 40% of $250
@@ -89,16 +89,16 @@ SECTOR_ETFS = {
 
 # Verified $10-$25 range June 2026
 SECTOR_STOCKS = {
-    "Technology":   ["SOFI", "SNAP", "INTC", "BB", "ERIC", "NOK"],
-    "Energy":       ["OXY", "SLB", "DVN", "HAL", "MRO", "CVX"],
+    "Technology":   ["SOFI", "SNAP", "INTC"],
+    "Energy":       ["OXY", "SLB", "DVN", "HAL", "CVX"],
     "Financials":   ["SOFI", "NU", "HOOD", "BAC", "C", "WFC"],
-    "Healthcare":   ["PFE", "NVAX", "MRNA", "CVS", "WBA"],
-    "ConsumerDisc": ["F", "GM", "RIVN", "NIO", "PARA", "WBD"],
+    "Healthcare":   ["PFE", "MRNA", "CVS", "WBA"],
+    "ConsumerDisc": ["F", "GM", "RIVN", "NIO"],
     "Industrials":  ["AAL", "UAL", "DAL", "GE"],
-    "Materials":    ["CLF", "AA", "FCX", "MT", "X"],
+    "Materials":    ["CLF", "AA", "FCX"],
     "Utilities":    ["PCG", "NEE", "SO", "EXC"],
-    "RealEstate":   ["OPEN", "RKT", "RDFN"],
-    "ConsumerStap": ["GO", "KR", "SFM"],
+    "RealEstate":   ["RKT"],
+    "ConsumerStap": ["KR"],
 }
 
 # Symbol → sector ETF map for sector strength filter
@@ -415,7 +415,7 @@ def send_weekly_report(all_trades, equity, qty):
         f"Account: ${equity:.2f} | QTY: {qty}\n"
         f"─────────────────\n"
         f"THIS WEEK\n"
-        f"Trades: {week_stats['total']}/3 | "
+        f"Trades: {week_stats['total']} | "
         f"W:{week_stats['wins']} L:{week_stats['losses']}\n"
         f"P&L: ${week_stats['total_pnl']}\n"
         f"─────────────────\n"
@@ -439,7 +439,7 @@ def send_eod_summary(regime, watchlist, trades_today,
     notify(
         f"📋 EOD — {datetime.now(ET).strftime('%b %d')}\n"
         f"Regime: {regime.upper()} | Trades: {trades_today}\n"
-        f"Week: {week_trade_count}/3 | P&L: ${weekly_pnl:.2f}\n"
+        f"Week: {trades_today}/{MAX_TRADES_PER_DAY} | P&L: ${weekly_pnl:.2f}\n"
         f"Watchlist: {', '.join(watchlist[:5]) if watchlist else 'None'}\n"
         f"{reason_str}"
     )
@@ -579,9 +579,9 @@ def scan_premarket_gaps():
         gap_stocks = []
         for sym, snap in snaps.items():
             try:
-                if not snap or not snap.daily_bar or not getattr(snap, 'prev_daily_bar', None):
+                if not snap or not getattr(snap, 'daily_bar', None) or not getattr(snap, 'prev_daily_bar', None):
                     continue
-                cur_open   = snap.daily_bar.open
+                cur_open   = getattr(snap, 'daily_bar', None).open
                 prev_close = getattr(snap, 'prev_daily_bar', None).close
                 gap_pct    = (cur_open - prev_close) / prev_close
 
@@ -670,9 +670,9 @@ def get_top_sectors():
         scored = []
         for sector, etf in SECTOR_ETFS.items():
             snap = snaps.get(etf)
-            if not snap or not snap.daily_bar:
+            if not snap or not getattr(snap, 'daily_bar', None):
                 continue
-            cur  = snap.daily_bar.close
+            cur  = getattr(snap, 'daily_bar', None).close
             prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
             pct  = (cur-prev)/prev if prev else 0
             scored.append((sector, pct))
@@ -705,11 +705,12 @@ def scan_symbols(regime, priority_symbols=None):
         scored = []
         for sym, snap in snaps.items():
             try:
-                if not snap or not snap.daily_bar:
+                if not snap or not getattr(snap, 'daily_bar', None):
                     continue
-                cur  = snap.daily_bar.close
-                op   = snap.daily_bar.open
-                vol  = snap.daily_bar.volume
+                db   = getattr(snap, 'daily_bar', None)
+                cur  = db.close
+                op   = db.open
+                vol  = db.volume
                 prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
                 if cur < 5 or cur > 60:
                     continue
@@ -734,26 +735,12 @@ def scan_symbols(regime, priority_symbols=None):
         top = [s[0] for s in scored[:10]]
 
         if not top:
-            scored_r = []
-            for sym, snap in snaps.items():
-                try:
-                    if not snap or not snap.daily_bar:
-                        continue
-                    cur  = snap.daily_bar.close
-                    prev = (getattr(snap, 'prev_daily_bar', None).close if getattr(snap, 'prev_daily_bar', None) else cur)
-                    if 5 <= cur <= 60:
-                        score = snap.daily_bar.volume * abs((cur-prev)/prev) if prev else 0
-                        scored_r.append((sym,score))
-                except Exception:
-                    continue
-            scored_r.sort(key=lambda x: x[1], reverse=True)
-            top = [s[0] for s in scored_r[:10]]
-
-        if not top:
+            print(f"Scanner: 0 stocks passed scoring out of {len(snaps)} snapshots")
             return None
 
         print(f"Watchlist ({regime}): {top}")
-        notify(f"Market: {regime.upper()} | Scanning: {', '.join(top)}")
+        notify(f"✅ Scanner OK ({len(scored)} scored) | "
+               f"{regime.upper()} | Watching: {', '.join(top)}")
         return top
     except Exception as e:
         print(f"Scanner exception: {e}")
@@ -1018,17 +1005,28 @@ def get_tp_sl(entry_price, qty, df=None, sl_multiplier=1.0):
     return base_per_share_tp*qty, base_per_share_sl*qty
 
 # =========================
-# PDT CHECK
+# INTRADAY MARGIN CHECK
+# PDT rule eliminated June 4 2026 — daytrade_count removed from Alpaca API July 6 2026
+# Now checks buying_power to ensure we can afford the trade
 # =========================
 
-def get_day_trade_count():
-    for attempt in range(3):
-        try:
-            return int(trading_client.get_account().daytrade_count)
-        except Exception as e:
-            print(f"PDT attempt {attempt+1} failed: {e}")
-            time.sleep(5)
-    return 0
+def get_buying_power():
+    """Returns available buying power from Alpaca account."""
+    try:
+        account = trading_client.get_account()
+        return float(account.buying_power)
+    except Exception as e:
+        print(f"Buying power check failed: {e}")
+        return 0.0
+
+def can_afford_trade(price, qty):
+    """Checks if we have enough buying power for this trade."""
+    cost = price * qty * 1.05  # 5% buffer for safety
+    bp   = get_buying_power()
+    if bp < cost:
+        print(f"Insufficient buying power: need ${cost:.2f}, have ${bp:.2f}")
+        return False
+    return True
 
 # =========================
 # ORDER EXECUTION
@@ -1045,14 +1043,12 @@ def place_order(symbol, side, qty):
 # =========================
 
 def get_trades_allowed_today(week_trade_count, trades_today):
-    now         = datetime.now(ET)
-    weekday     = now.weekday()
-    trades_left = MAX_DAY_TRADES - week_trade_count
-    if trades_left <= 0:
-        return 0
-    if weekday >= 3:
-        return trades_left
-    return min(trades_left, max(1, trades_left-(4-weekday)))
+    """
+    PDT eliminated June 4 2026 — no weekly trade limit.
+    Now allows up to MAX_TRADES_PER_DAY trades per day.
+    week_trade_count kept for reporting/stats only.
+    """
+    return max(0, MAX_TRADES_PER_DAY - trades_today)
 
 # =========================
 # STATE
@@ -1082,12 +1078,12 @@ entry_times      = {}
 partial_pnl_total = 0.0
 
 notify(
-    f"Bot started — PDT margin account\n"
+    f"Bot started — NO PDT LIMIT (rule eliminated June 4 2026)\n"
     f"TP: ${TAKE_PROFIT} | SL: ${STOP_LOSS} | "
     f"Trail: +${TRAIL_ACTIVATION}\n"
     f"Position: {int(POSITION_PCT*100)}% | "
-    f"Multi-TF + Smart exits active\n"
-    f"Week: {week_trade_count}/3 | P&L: ${weekly_pnl:.2f}"
+    f"Up to {MAX_TRADES_PER_DAY} trades/day\n"
+    f"Trades this week: {week_trade_count} | P&L: ${weekly_pnl:.2f}"
 )
 
 # =========================
@@ -1129,7 +1125,8 @@ while True:
             notify(
                 f"New day: {today}\n"
                 f"QTY: {qty} | Equity: ${equity:.2f}\n"
-                f"Target: {allowed} trade(s) | Week: {week_trade_count}/3"
+                f"Target: {allowed} trades today (no PDT limit) | "
+                f"Week total: {week_trade_count}"
             )
             check_go_live_recommendation()
 
@@ -1161,36 +1158,41 @@ while True:
             result    = scan_symbols(regime, premarket_gaps)
             if result is None:
                 scanner_failed = True
+                print("[9:45 attempt] Scanner returned None — will retry at 9:50 AM")
             else:
                 watchlist      = result
                 scanner_failed = False
+                print(f"[9:45 attempt] Succeeded: {watchlist}")
 
         # -- SCANNER RETRY at 9:50 AM --
         if scanner_failed and not watchlist and is_scanner_retry_time():
-            print("Retrying scanner at 9:50 AM...")
+            print("[9:50 attempt] Retrying scanner...")
             regime = get_market_regime()
             result = scan_symbols(regime, premarket_gaps)
             if result is not None:
                 watchlist      = result
                 scanner_failed = False
-                print(f"9:50 retry succeeded: {watchlist}")
+                print(f"[9:50 attempt] Succeeded: {watchlist}")
+            else:
+                print("[9:50 attempt] Still failed — will retry at 10:00 AM")
             # If still None, wait for 10:00 AM retry below
 
         # -- SCANNER SECOND RETRY at 10:00 AM --
         if scanner_failed and not watchlist and is_scanner_second_retry_time():
-            print("Final scanner retry at 10:00 AM...")
+            print("[10:00 attempt] Final scanner retry...")
             regime = get_market_regime()
             result = scan_symbols(regime, premarket_gaps)
             if result is not None:
                 watchlist      = result
                 scanner_failed = False
-                print(f"10 AM retry succeeded: {watchlist}")
+                print(f"[10:00 attempt] Succeeded: {watchlist}")
             else:
                 # All retries exhausted -- use fallback
                 watchlist      = FALLBACK_SYMBOLS
                 scanner_failed = False
-                notify(f"Scanner failed 3x -- using fallback: "
-                       f"{', '.join(watchlist)}")
+                print("[10:00 attempt] Still failed — using fallback")
+                notify(f"⚠️ Scanner failed 3x (9:45/9:50/10:00) -- "
+                       f"using fallback: {', '.join(watchlist)}")
 
         if not watchlist:
             print(f"Waiting for scanner — {now_et.strftime('%H:%M ET')}")
@@ -1214,12 +1216,12 @@ while True:
         # ── THURSDAY REMINDER ──
         if (now_et.weekday()==3 and now_et.hour==9
                 and now_et.minute==45 and week_trade_count==0):
-            notify("⚠️ Thursday — 0 trades this week")
+            notify("⚠️ Thursday — 0 trades this week\n"
+                   "No PDT limit — up to 3 trades today")
 
         # ── GET STREAK ADJUSTMENTS ──
         sl_mult, pos_mult = get_streak_adjustments()
 
-        pdt_used      = get_day_trade_count()
         allowed_today = get_trades_allowed_today(week_trade_count, trades_today)
 
         # ── FORCE EXIT NEAR CLOSE ──
@@ -1240,7 +1242,7 @@ while True:
                     notify(
                         f"EOD CLOSE {sym} | ${pnl:+.2f}\n"
                         f"Week P&L: ${weekly_pnl:.2f} | "
-                        f"Trades: {week_trade_count}/3"
+                        f"Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                     )
                     del positions[sym]
                     entry_times.pop(sym, None)
@@ -1303,7 +1305,7 @@ while True:
                         trades_today     += 1
                         notify(
                             f"✅ TP HIT {symbol} @ ${current_price:.2f}\n"
-                            f"+${pnl:.2f} | Week: {week_trade_count}/3"
+                            f"+${pnl:.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
@@ -1321,7 +1323,7 @@ while True:
                         trades_today     += 1
                         notify(
                             f"🔒 TRAIL STOP {symbol} @ ${current_price:.2f}\n"
-                            f"${pnl:+.2f} | Week: {week_trade_count}/3"
+                            f"${pnl:+.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
@@ -1345,7 +1347,7 @@ while True:
                                 f"🧠 SMART EXIT {symbol} "
                                 f"@ ${current_price:.2f}\n"
                                 f"${pnl:+.2f} | {exit_reason}\n"
-                                f"Week: {week_trade_count}/3"
+                                f"Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                             )
                             del positions[symbol]
                             entry_times.pop(symbol, None)
@@ -1362,7 +1364,7 @@ while True:
                             trades_today     += 1
                             notify(
                                 f"🛑 SL HIT {symbol} @ ${current_price:.2f}\n"
-                                f"${pnl:.2f} | Week: {week_trade_count}/3"
+                                f"${pnl:.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
                             )
                             del positions[symbol]
                             entry_times.pop(symbol, None)
@@ -1371,8 +1373,6 @@ while True:
                 elif (not is_after_no_entry_time()
                       and is_orb_window_complete()
                       and is_orb_still_valid()
-                      and pdt_used < MAX_DAY_TRADES
-                      and week_trade_count < MAX_DAY_TRADES
                       and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
                       and symbol not in pending_orders
@@ -1424,6 +1424,9 @@ while True:
 
                     if (regime in ["bullish","choppy"]
                             and current_price > high*(1+ORB_BUFFER)):
+                        if not can_afford_trade(current_price, trade_qty):
+                            log_skip(symbol, f"Insufficient buying power")
+                            continue
                         pending_orders.add(symbol)
                         place_order(symbol, OrderSide.BUY, trade_qty)
                         positions[symbol] = {
@@ -1436,7 +1439,7 @@ while True:
                             "partial_taken": False,
                         }
                         entry_times[symbol] = now_et
-                        pdt_used       += 1
+                        # No PDT limit — buying power checked before order
                         allowed_today  -= 1
                         no_trade_reason = ""
 
@@ -1447,7 +1450,7 @@ while True:
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
                             f"Trail: +${TRAIL_ACTIVATION} | "
                             f"Partial exit at TP\n"
-                            f"Week: {week_trade_count+1}/3 | "
+                            f"Today: {trades_today+1}/{MAX_TRADES_PER_DAY} | "
                             f"Time quality: {time_quality:.0%}"
                         )
                     else:
