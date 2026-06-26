@@ -2,3 +2,4 @@ alpaca-py
 requests
 pytz
 feedparser
+anthropic

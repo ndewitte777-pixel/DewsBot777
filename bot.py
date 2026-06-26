@@ -46,10 +46,10 @@ MIN_SL_PCT       = 0.005
 
 # Entry filters
 REGIME_THRESHOLD     = 0.001
-VOLUME_MULTIPLIER    = 1.2
+VOLUME_MULTIPLIER    = 1.1   # was 1.2 — slightly easier volume confirmation
 ORB_BUFFER           = 0.001
-MIN_ORB_RANGE_PCT    = 0.005
-MIN_SPY_RANGE_PCT    = 0.001
+MIN_ORB_RANGE_PCT    = 0.003 # was 0.005 — allows tighter (marginal) setups to trade
+MIN_SPY_RANGE_PCT    = 0.0006 # was 0.001 — only skips genuinely DEAD market days
 SCANNER_RETRY_MINUTE = 50
 
 # Time filters
@@ -70,6 +70,17 @@ TRADING_PAUSED = os.environ.get("TRADING_PAUSED", "false").lower() == "true"
 
 # Allow re-entry on a stock that already hit TP earlier the same day
 ALLOW_REENTRY = os.environ.get("ALLOW_REENTRY", "true").lower() == "true"
+REENTRY_CAP   = int(os.environ.get("REENTRY_CAP", "3"))  # max entries per symbol per day
+
+# ── CLAUDE PROFIT SCOUT AGENT ──
+# Set USE_AGENT=true in Railway to let the Claude agent pick stocks.
+# Falls back to the bot's own scanner if disabled or if the call fails.
+USE_AGENT       = os.environ.get("USE_AGENT", "false").lower() == "true"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# The agent ID from your Anthropic Console (the Daily Stock Profit Scout)
+AGENT_ID        = os.environ.get("AGENT_ID", "")
+AGENT_PICKS_FILE = os.path.join(DATA_DIR, "agent_picks.csv")
+
 LOG_FILE          = os.path.join(DATA_DIR, "trade_log.csv")
 SKIP_LOG_FILE     = os.path.join(DATA_DIR, "skip_log.csv")
 MILESTONE_FILE    = os.path.join(DATA_DIR, "milestones.txt")
@@ -197,14 +208,14 @@ def init_log():
         with open(LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow([
                 "date","symbol","side","entry_price","exit_price",
-                "qty","pnl","result","regime","exit_reason"
+                "qty","pnl","result","regime","exit_reason","source"
             ])
     if not os.path.exists(SKIP_LOG_FILE):
         with open(SKIP_LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow(["date","symbol","reason"])
 
 def log_trade(symbol, side, entry_price, exit_price,
-              qty, regime, exit_reason=""):
+              qty, regime, exit_reason="", source="scanner"):
     pnl    = ((exit_price - entry_price) * qty if side == "LONG"
               else (entry_price - exit_price) * qty)
     result = "WIN" if pnl > 0 else "LOSS"
@@ -213,7 +224,7 @@ def log_trade(symbol, side, entry_price, exit_price,
             datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
             symbol, side,
             round(entry_price,2), round(exit_price,2),
-            qty, round(pnl,2), result, regime, exit_reason
+            qty, round(pnl,2), result, regime, exit_reason, source
         ])
     return pnl, result
 
@@ -417,6 +428,22 @@ def send_weekly_report(all_trades, equity, qty):
     er = all_stats.get("exit_reasons", {})
     best_exit = max(er, key=er.get) if er else "none"
 
+    # Agent vs scanner breakdown
+    agent_trades   = [t for t in all_trades if t.get("source") == "agent"]
+    scanner_trades = [t for t in all_trades if t.get("source") != "agent"]
+    a_stats = calc_stats(agent_trades)
+    s_stats = calc_stats(scanner_trades)
+    source_line = ""
+    if agent_trades or scanner_trades:
+        source_line = (
+            f"─────────────────\n"
+            f"BY SOURCE\n"
+            f"🤖 Agent: {a_stats['total']} trades | "
+            f"{a_stats['win_rate']}% win | ${a_stats['total_pnl']}\n"
+            f"🔍 Scanner: {s_stats['total']} trades | "
+            f"{s_stats['win_rate']}% win | ${s_stats['total_pnl']}\n"
+        )
+
     notify(
         f"📊 WEEKLY REPORT — Week {week_num}\n"
         f"Account: ${equity:.2f} | QTY: {qty}\n"
@@ -432,6 +459,7 @@ def send_weekly_report(all_trades, equity, qty):
         f"P&L: ${all_stats['total_pnl']} | "
         f"PF: {all_stats['profit_factor']}\n"
         f"Best exit: {best_exit}\n"
+        f"{source_line}"
         f"Status: {trend} | {projected}"
     )
 
@@ -510,6 +538,17 @@ def is_premarket_scan_time():
     """9:00 AM — run pre-market gap scan."""
     now = datetime.now(ET)
     return now.hour == 9 and now.minute == 0
+
+def is_agent_first_call_time():
+    """9:30 AM — first agent call at the open. Runs ~7 min (blocking), so it
+    finishes around 9:37, well before the 9:45 entry window opens."""
+    now = datetime.now(ET)
+    return now.hour == 9 and now.minute == 30
+
+def is_agent_second_call_time():
+    # Deprecated — second daily call removed to cut cost. Kept as a no-op
+    # so any lingering reference won't crash. Always False.
+    return False
 
 def get_time_quality_score():
     """
@@ -687,6 +726,281 @@ def get_top_sectors():
         return [s[0] for s in scored[:3]]
     except Exception:
         return ["Technology","ConsumerDisc","Financials"]
+
+# ============================================================
+# CLAUDE PROFIT SCOUT AGENT
+# ============================================================
+# This calls your "Daily Stock Profit Scout" managed agent to get
+# a ranked list of tickers. The bot then filters those to its
+# $10-$25 range and trades them, tagging each as an agent pick.
+#
+# >>> THE ONE FUNCTION YOU MUST VERIFY: call_profit_scout_agent() <<<
+# Managed Agents use a SESSION-based REST API (create session -> stream
+# events -> read final text). The exact request/response shape and beta
+# header should be confirmed against your current Anthropic Console docs.
+# Everything ELSE in this file is complete and tested.
+# ============================================================
+
+import json
+import re as _re
+
+# The instruction sent on each call. Your agent's system prompt has the full
+# research criteria; this constrains the OUTPUT to keep it fast and cheap.
+# We explicitly ask for a SHORT analysis — the 12k-token essays cost more and
+# add minutes to composition. The bot only needs the final TICKERS line.
+AGENT_OUTPUT_INSTRUCTION = (
+    "Screen today's market for the best intraday LONG breakout candidates "
+    "priced $10-$25 with high liquidity and a clear momentum/catalyst edge. "
+    "Keep your written analysis BRIEF — one short sentence per pick maximum "
+    "(ticker, price, the catalyst). Do NOT write long essays; be concise to "
+    "save time. "
+    "End with ONE final line in EXACTLY this format and nothing after it:\n"
+    "TICKERS: SYM1,SYM2,SYM3\n"
+    "List 3 to 7 tickers, strongest first, US symbols only, no $ signs. "
+    "If fewer than 3 qualify, list only those. If none qualify: TICKERS: NONE"
+)
+
+def parse_agent_tickers(text):
+    """
+    Extracts the TICKERS: line from the agent's response.
+    Returns a list of uppercase symbols, or [] if none/NONE.
+    Robust to dollar signs, spaces, lowercase, and trailing prose.
+    """
+    if not text:
+        return []
+    # Find the TICKERS: line (case-insensitive, last occurrence wins).
+    # Allow $ in the captured group so we can strip it after.
+    matches = _re.findall(r'TICKERS:\s*([A-Za-z0-9 ,\.\$]+)', text)
+    if not matches:
+        return []
+    raw = matches[-1].upper().strip()
+
+    # Explicit "no trades today" signal
+    if raw.startswith("NONE"):
+        return []
+
+    syms = []
+    for tok in raw.replace(' ', '').replace('$', '').split(','):
+        tok = tok.strip().upper()
+        # Skip the NONE keyword if it appears as a token
+        if tok == "NONE" or not tok:
+            continue
+        # Valid ticker: 1-5 letters, optionally a dot-class (e.g. BRK.B)
+        if _re.fullmatch(r'[A-Z]{1,5}(\.[A-Z])?', tok):
+            syms.append(tok)
+    # De-dupe preserving order
+    seen = set()
+    out = []
+    for s in syms:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+def call_profit_scout_agent():
+    """
+    Calls the managed "ORB Stock Screener" agent and returns its raw text
+    output (string), or None on any failure.
+
+    Managed Agents flow (per Anthropic's official quickstart):
+      1. Ensure an environment exists (cloud sandbox, reusable across calls)
+      2. Create a session referencing the agent ID + environment ID
+      3. Open the SSE event stream, send the user message
+      4. Collect agent.message text blocks until session.status_idle
+      5. Terminate the session (stops the $0.08/session-hour billing)
+
+    Required Railway env vars:
+      USE_AGENT=true
+      ANTHROPIC_API_KEY=sk-ant-...
+      AGENT_ID=ag_...        (from client.beta.agents.create)
+    Optional:
+      AGENT_ENV_ID=env_...   (reuse one environment; created automatically if unset)
+    """
+    if not USE_AGENT:
+        return None
+    if not ANTHROPIC_API_KEY or not AGENT_ID:
+        print("Agent: USE_AGENT set but ANTHROPIC_API_KEY or AGENT_ID missing")
+        return None
+
+    session_id = None
+    client = None
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        print("Agent: 'anthropic' package not installed — add it to requirements.txt")
+        return None
+
+    try:
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # 1. Environment — reuse if AGENT_ENV_ID provided, else create one.
+        env_id = os.environ.get("AGENT_ENV_ID", "").strip()
+        if not env_id:
+            environment = client.beta.environments.create(
+                name="orb-screener-env",
+                config={"type": "cloud",
+                        "networking": {"type": "unrestricted"}},
+            )
+            env_id = environment.id
+            print(f"Agent: created environment {env_id} "
+                  f"(set AGENT_ENV_ID={env_id} in Railway to reuse it)")
+
+        # 2. Session referencing the pre-created agent + environment.
+        # Agent passed as object form {"type":"agent","id":...} per Console.
+        session = client.beta.sessions.create(
+            agent={"type": "agent", "id": AGENT_ID},
+            environment_id=env_id,
+            title="ORB daily screen",
+        )
+        session_id = session.id
+
+        # 3+4. Open stream, send message, collect agent text.
+        # The agent emits many agent.message events during research (narration
+        # like "I'll search for..."). We keep ALL text but the parser pulls the
+        # LAST TICKERS: line, so interim narration is harmless. We also track
+        # the final message separately as the most likely place for the answer.
+        all_text       = []
+        last_message   = ""
+        # Real runs observed at ~7 min: research ~3 min, then a LONG final
+        # message (12k+ tokens) that can take 4+ min to compose with a big
+        # silent gap before it. Cap at 10 min; stall timeout must exceed that
+        # composing gap or we'd cut off right before the TICKERS line.
+        deadline       = time.monotonic() + 600   # 10-min wall-clock cap
+        last_activity  = time.monotonic()
+        idle_timeout   = 300  # 5 min — final message gap can be 4+ min
+        tool_calls     = 0
+
+        with client.beta.sessions.events.stream(session_id) as stream:
+            client.beta.sessions.events.send(
+                session_id,
+                events=[{
+                    "type": "user.message",
+                    "content": [{"type": "text",
+                                 "text": AGENT_OUTPUT_INSTRUCTION}],
+                }],
+            )
+            for event in stream:
+                now_mono = time.monotonic()
+                # Hard wall-clock cap — protects the trading window
+                if now_mono > deadline:
+                    print(f"Agent: hit 10-min cap after {tool_calls} tool calls "
+                          f"— stopping stream")
+                    break
+                # Stall detection — no events for 90s means something hung
+                if now_mono - last_activity > idle_timeout:
+                    print("Agent: no activity for 90s — assuming stalled")
+                    break
+                last_activity = now_mono
+
+                etype = getattr(event, "type", "")
+                if etype == "agent.message":
+                    msg_parts = []
+                    for block in getattr(event, "content", []) or []:
+                        if getattr(block, "type", "") == "text":
+                            t = getattr(block, "text", "")
+                            msg_parts.append(t)
+                            all_text.append(t)
+                    if msg_parts:
+                        last_message = "".join(msg_parts)
+                elif etype == "agent.tool_use":
+                    tool_calls += 1
+                elif etype == "session.status_idle":
+                    print(f"Agent: finished after {tool_calls} tool calls")
+                    break
+                elif etype == "session.status_terminated":
+                    print("Agent: session terminated by server")
+                    break
+
+        # Prefer the last message if it contains the TICKERS line;
+        # otherwise fall back to the full concatenated transcript.
+        if "TICKERS:" in last_message.upper():
+            text = last_message.strip()
+        else:
+            text = "".join(all_text).strip()
+
+        if not text:
+            print("Agent: stream returned no text")
+            return None
+        return text
+
+    except Exception as e:
+        print(f"Agent call failed: {e}")
+        return None
+    finally:
+        # 5. Always terminate the session so it stops billing.
+        if client is not None and session_id is not None:
+            try:
+                client.beta.sessions.terminate(session_id)
+            except Exception as e:
+                print(f"Agent: could not terminate session {session_id}: {e}")
+
+def log_agent_picks(call_label, raw_tickers, kept_tickers):
+    """Logs what the agent picked and what survived the price filter."""
+    try:
+        new_file = not os.path.exists(AGENT_PICKS_FILE)
+        with open(AGENT_PICKS_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["date","call","agent_raw","kept_after_filter"])
+            w.writerow([
+                datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+                call_label,
+                "|".join(raw_tickers),
+                "|".join(kept_tickers),
+            ])
+    except Exception as e:
+        print(f"Could not log agent picks: {e}")
+
+def get_agent_watchlist(call_label):
+    """
+    Full agent flow: call agent -> parse tickers -> filter to $10-$25
+    using a live snapshot.
+    Returns (status, picks):
+      status "ok"     -> picks is the list (may be empty if NONE/all filtered)
+      status "failed" -> the agent call itself errored (None returned)
+    This lets the caller count real failures separately from quiet days.
+    """
+    raw_text = call_profit_scout_agent()
+    if not raw_text:
+        return "failed", []
+
+    tickers = parse_agent_tickers(raw_text)
+    if not tickers:
+        # Agent ran fine but returned no tradeable names (e.g. TICKERS: NONE)
+        print(f"Agent ({call_label}): no tickers (quiet day or NONE)")
+        return "ok", []
+
+    print(f"Agent ({call_label}) raw picks: {tickers}")
+
+    # Filter to $10-$25 range using a live snapshot
+    kept = []
+    try:
+        req   = StockSnapshotRequest(symbol_or_symbols=tickers)
+        snaps = data_client.get_stock_snapshot(req)
+        for sym in tickers:
+            snap = snaps.get(sym)
+            db   = getattr(snap, 'daily_bar', None) if snap else None
+            if not db:
+                continue
+            price = db.close
+            if MIN_PRICE <= price <= MAX_PRICE:
+                kept.append(sym)
+            else:
+                print(f"Agent pick {sym} @ ${price:.2f} outside "
+                      f"${MIN_PRICE}-${MAX_PRICE} — dropped")
+    except Exception as e:
+        print(f"Agent price-filter failed: {e}")
+        # Couldn't verify prices — treat as failure so we fall back cleanly
+        return "failed", []
+
+    log_agent_picks(call_label, tickers, kept)
+
+    if kept:
+        notify(f"🤖 Agent ({call_label}) picks in range: "
+               f"{', '.join(kept)}")
+    else:
+        print(f"Agent ({call_label}): no picks survived price filter")
+    return "ok", kept
 
 def scan_symbols(regime, priority_symbols=None):
     """
@@ -1087,6 +1401,11 @@ equity           = 250.0
 entry_times      = {}
 partial_pnl_total = 0.0
 reentry_count    = {}   # tracks how many times each symbol traded today (for re-entry cap)
+agent_symbols    = set() # symbols picked by the agent (for trade tagging)
+agent_call1_done = False # 9:35 AM agent call fired
+agent_call2_done = False # 11:00 AM agent call fired
+agent_fail_count = 0     # consecutive failed agent calls (auto-disables after 3)
+agent_disabled_today = False  # set if agent fails too many times in one day
 
 notify(
     f"Bot started — NO PDT LIMIT (rule eliminated June 4 2026)\n"
@@ -1095,8 +1414,9 @@ notify(
     f"Position: {int(POSITION_PCT*100)}% | "
     f"Up to {MAX_TRADES_PER_DAY} trades/day | "
     f"{MAX_POSITIONS} concurrent positions\n"
-    f"Re-entry: {'ON' if ALLOW_REENTRY else 'OFF'} | "
+    f"Re-entry: {'ON' if ALLOW_REENTRY else 'OFF'} (cap {REENTRY_CAP}) | "
     f"{'⏸️ TRADING PAUSED' if TRADING_PAUSED else '▶️ Active'}\n"
+    f"Stock picker: {'🤖 Claude Agent (9:30 daily)' if USE_AGENT else '🔍 Built-in scanner'}\n"
     f"Trades this week: {week_trade_count} | P&L: ${weekly_pnl:.2f}"
 )
 
@@ -1134,6 +1454,11 @@ while True:
             no_trade_reason   = ""
             partial_pnl_total = 0.0
             reentry_count     = {}
+            agent_symbols     = set()
+            agent_call1_done  = False
+            agent_call2_done  = False
+            agent_fail_count  = 0
+            agent_disabled_today = False
             last_date         = today
             qty, equity       = get_dynamic_qty()
             allowed           = get_trades_allowed_today(week_trade_count, 0)
@@ -1167,7 +1492,30 @@ while True:
             premarket_gaps = scan_premarket_gaps()
             premarket_done = True
 
-        # ── BUILD WATCHLIST at 9:45 AM ──
+        # ── AGENT CALL #1 — 9:35 AM (before entry window opens) ──
+        if (USE_AGENT and not agent_disabled_today
+                and is_agent_first_call_time() and not agent_call1_done):
+            agent_call1_done = True
+            print("[9:35] Calling ORB Screener agent (call 1)...")
+            status, picks = get_agent_watchlist("9:35am")
+            if status == "failed":
+                agent_fail_count += 1
+                print(f"[9:35] Agent call failed ({agent_fail_count} total) — "
+                      "scanner will run at 9:45 as fallback")
+            elif picks:
+                watchlist = picks
+                agent_symbols.update(picks)
+                scanner_failed = False
+                print(f"[9:35] Agent watchlist set: {watchlist}")
+            else:
+                print("[9:35] Agent ran but found no in-range names — "
+                      "scanner will run at 9:45 as fallback")
+            if agent_fail_count >= 3:
+                agent_disabled_today = True
+                notify("⚠️ Agent disabled for today after 3 failed calls — "
+                       "bot using its own scanner")
+
+        # ── BUILD WATCHLIST at 9:45 AM (scanner — fallback when no agent picks) ──
         if not watchlist and is_orb_window_complete() and not scanner_failed:
             regime    = get_market_regime()
             result    = scan_symbols(regime, premarket_gaps)
@@ -1249,7 +1597,8 @@ while True:
                     place_order(sym, exit_side, pos["qty"])
                     pnl, _ = log_trade(
                         sym, pos["side"], pos["entry"],
-                        exit_price, pos["qty"], regime, "EOD forced close"
+                        exit_price, pos["qty"], regime, "EOD forced close",
+                        source=("agent" if sym in agent_symbols else "scanner")
                     )
                     weekly_pnl       += pnl
                     week_trade_count += 1
@@ -1301,7 +1650,8 @@ while True:
                         if new_pos is None:
                             log_trade(symbol, pos["side"], pos["entry"],
                                       current_price, pos["qty"],
-                                      regime, "TP full exit")
+                                      regime, "TP full exit",
+                                      source=("agent" if symbol in agent_symbols else "scanner"))
                             week_trade_count += 1
                             trades_today     += 1
                             del positions[symbol]
@@ -1315,7 +1665,8 @@ while True:
                         place_order(symbol, exit_side, pos["qty"])
                         pnl, _ = log_trade(
                             symbol, pos["side"], pos["entry"],
-                            current_price, pos["qty"], regime, "TP hit"
+                            current_price, pos["qty"], regime, "TP hit",
+                            source=("agent" if symbol in agent_symbols else "scanner")
                         )
                         weekly_pnl       += pnl
                         week_trade_count += 1
@@ -1334,7 +1685,8 @@ while True:
                         pnl, _ = log_trade(
                             symbol, pos["side"], pos["entry"],
                             current_price, pos["qty"], regime,
-                            f"Trail stop ${pos['trail_price']:.2f}"
+                            f"Trail stop ${pos['trail_price']:.2f}",
+                            source=("agent" if symbol in agent_symbols else "scanner")
                         )
                         weekly_pnl       += pnl
                         week_trade_count += 1
@@ -1357,7 +1709,8 @@ while True:
                             pnl, _ = log_trade(
                                 symbol, pos["side"], pos["entry"],
                                 current_price, pos["qty"],
-                                regime, exit_reason
+                                regime, exit_reason,
+                                source=("agent" if symbol in agent_symbols else "scanner")
                             )
                             weekly_pnl       += pnl
                             week_trade_count += 1
@@ -1377,7 +1730,8 @@ while True:
                             place_order(symbol, exit_side, pos["qty"])
                             pnl, _ = log_trade(
                                 symbol, pos["side"], pos["entry"],
-                                current_price, pos["qty"], regime, "SL hit"
+                                current_price, pos["qty"], regime, "SL hit",
+                                source=("agent" if symbol in agent_symbols else "scanner")
                             )
                             weekly_pnl       += pnl
                             week_trade_count += 1
@@ -1398,7 +1752,7 @@ while True:
                       and allowed_today > 0
                       and len(positions) < MAX_POSITIONS
                       and symbol not in pending_orders
-                      and reentry_count.get(symbol, 0) < (2 if ALLOW_REENTRY else 1)
+                      and reentry_count.get(symbol, 0) < (REENTRY_CAP if ALLOW_REENTRY else 1)
                       and has_volume_confirmation(df)
                       and has_momentum(df)):
 
