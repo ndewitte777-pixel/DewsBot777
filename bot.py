@@ -927,12 +927,19 @@ def call_profit_scout_agent():
         print(f"Agent call failed: {e}")
         return None
     finally:
-        # 5. Always terminate the session so it stops billing.
+        # 5. Clean up the session. The streaming context manager already
+        # closes the connection on exit, and idle sessions don't bill for
+        # active runtime — so this is best-effort tidiness, not critical.
+        # Method name varies by SDK version; try the known ones quietly.
         if client is not None and session_id is not None:
-            try:
-                client.beta.sessions.terminate(session_id)
-            except Exception as e:
-                print(f"Agent: could not terminate session {session_id}: {e}")
+            for method_name in ("delete", "cancel", "end"):
+                try:
+                    method = getattr(client.beta.sessions, method_name, None)
+                    if method:
+                        method(session_id)
+                        break
+                except Exception:
+                    continue  # silent — cleanup failure is harmless
 
 def log_agent_picks(call_label, raw_tickers, kept_tickers):
     """Logs what the agent picked and what survived the price filter."""
