@@ -1409,7 +1409,7 @@ entry_times      = {}
 partial_pnl_total = 0.0
 reentry_count    = {}   # tracks how many times each symbol traded today (for re-entry cap)
 agent_symbols    = set() # symbols picked by the agent (for trade tagging)
-agent_call1_done = False # 9:35 AM agent call fired
+agent_call1_done = False # 9:30 AM agent call fired
 agent_call2_done = False # 11:00 AM agent call fired
 agent_fail_count = 0     # consecutive failed agent calls (auto-disables after 3)
 agent_disabled_today = False  # set if agent fails too many times in one day
@@ -1499,23 +1499,23 @@ while True:
             premarket_gaps = scan_premarket_gaps()
             premarket_done = True
 
-        # ── AGENT CALL #1 — 9:35 AM (before entry window opens) ──
+        # ── AGENT CALL #1 — 9:30 AM (before entry window opens) ──
         if (USE_AGENT and not agent_disabled_today
                 and is_agent_first_call_time() and not agent_call1_done):
             agent_call1_done = True
-            print("[9:35] Calling ORB Screener agent (call 1)...")
-            status, picks = get_agent_watchlist("9:35am")
+            print("[9:30] Calling ORB Screener agent (call 1)...")
+            status, picks = get_agent_watchlist("9:30am")
             if status == "failed":
                 agent_fail_count += 1
-                print(f"[9:35] Agent call failed ({agent_fail_count} total) — "
+                print(f"[9:30] Agent call failed ({agent_fail_count} total) — "
                       "scanner will run at 9:45 as fallback")
             elif picks:
                 watchlist = picks
                 agent_symbols.update(picks)
                 scanner_failed = False
-                print(f"[9:35] Agent watchlist set: {watchlist}")
+                print(f"[9:30] Agent watchlist set: {watchlist}")
             else:
-                print("[9:35] Agent ran but found no in-range names — "
+                print("[9:30] Agent ran but found no in-range names — "
                       "scanner will run at 9:45 as fallback")
             if agent_fail_count >= 3:
                 agent_disabled_today = True
