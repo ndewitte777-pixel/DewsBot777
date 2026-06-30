@@ -61,6 +61,18 @@ NO_ENTRY_AFTER_MINUTE  = 45  # was 30 — avoid last 15min chop
 # Milestone levels for notifications
 MILESTONES = [260, 275, 300, 350, 500, 750, 1000]
 
+# ── ENTRY FILTER TOGGLES ──
+# These heavy filters were stacked on top of each other and reduced trading
+# to almost zero (7 filters multiplied together = ~8% pass rate). Default OFF
+# to restore the looser, daily-trading behavior of the earlier bot. Turn any
+# back ON in Railway once you have data showing it actually improves win rate.
+#   Keep ALWAYS ON (core): volume confirmation, momentum, ORB range validity.
+#   Toggleable (default off): news, sector, 5-min confirm, time quality.
+FILTER_NEWS         = os.environ.get("FILTER_NEWS", "false").lower() == "true"
+FILTER_SECTOR       = os.environ.get("FILTER_SECTOR", "false").lower() == "true"
+FILTER_5MIN         = os.environ.get("FILTER_5MIN", "false").lower() == "true"
+FILTER_TIME_QUALITY = os.environ.get("FILTER_TIME_QUALITY", "false").lower() == "true"
+
 PAPER_START_DATE  = os.environ.get("PAPER_START_DATE", "2026-05-13")
 DATA_DIR          = os.environ.get("DATA_DIR", ".")
 
@@ -1424,6 +1436,12 @@ notify(
     f"Re-entry: {'ON' if ALLOW_REENTRY else 'OFF'} (cap {REENTRY_CAP}) | "
     f"{'⏸️ TRADING PAUSED' if TRADING_PAUSED else '▶️ Active'}\n"
     f"Stock picker: {'🤖 Claude Agent (9:30 daily)' if USE_AGENT else '🔍 Built-in scanner'}\n"
+    f"Extra filters: "
+    f"{'News ' if FILTER_NEWS else ''}"
+    f"{'Sector ' if FILTER_SECTOR else ''}"
+    f"{'5min ' if FILTER_5MIN else ''}"
+    f"{'TimeQ ' if FILTER_TIME_QUALITY else ''}"
+    f"{'(none — core only)' if not any([FILTER_NEWS,FILTER_SECTOR,FILTER_5MIN,FILTER_TIME_QUALITY]) else ''}\n"
     f"Trades this week: {week_trade_count} | P&L: ${weekly_pnl:.2f}"
 )
 
@@ -1623,10 +1641,44 @@ while True:
             time.sleep(60)
             continue
 
+        # ── ENTRY-WINDOW HEARTBEAT (once per loop, only during entry window) ──
+        # Without this the console goes silent when no stock breaks out, making
+        # it impossible to tell "correctly waiting" from "silently broken".
+        # Caches each symbol's data so the main loop below reuses it (no double fetch).
+        data_cache = {}
+        if (is_orb_window_complete() and is_orb_still_valid()
+                and not is_after_no_entry_time()):
+            status_bits = []
+            for sym in watchlist[:7]:
+                try:
+                    d = get_data(sym)
+                    data_cache[sym] = d
+                    if d.empty or len(d) < 20:
+                        status_bits.append(f"{sym}:nodata")
+                        continue
+                    px = d["close"].iloc[-1]
+                    h, l = get_orb_levels(d)
+                    broke = px > h * (1 + ORB_BUFFER)
+                    vol_ok = has_volume_confirmation(d)
+                    mom_ok = has_momentum(d)
+                    flag = ("BREAKOUT" if broke and vol_ok and mom_ok
+                            else f"{'B' if broke else '-'}"
+                                 f"{'V' if vol_ok else '-'}"
+                                 f"{'M' if mom_ok else '-'}")
+                    status_bits.append(f"{sym}:{flag}")
+                except Exception:
+                    status_bits.append(f"{sym}:err")
+            print(f"[{now_et.strftime('%H:%M')}] {regime} | "
+                  f"pos:{len(positions)}/{MAX_POSITIONS} "
+                  f"today:{trades_today}/{MAX_TRADES_PER_DAY} | "
+                  + " ".join(status_bits))
+
         # ── PROCESS EACH SYMBOL ──
         for symbol in watchlist:
             try:
-                df = get_data(symbol)
+                df = data_cache.get(symbol)
+                if df is None:
+                    df = get_data(symbol)
                 if df.empty or len(df) < 20:
                     continue
 
@@ -1777,27 +1829,32 @@ while True:
                         no_trade_reason = skip_reason
                         continue
 
-                    # News filter
-                    if has_major_news(symbol):
+                    # News filter — only if enabled (default off)
+                    if FILTER_NEWS and has_major_news(symbol):
                         log_skip(symbol, "Major news today — skipping")
                         continue
 
-                    # Sector strength filter
-                    if not is_sector_bullish(symbol):
+                    # Sector strength filter — only if enabled (default off)
+                    # This was a major blocker: one red sector ETF vetoed
+                    # otherwise-good setups. Off by default restores trading.
+                    if FILTER_SECTOR and not is_sector_bullish(symbol):
                         log_skip(symbol, "Sector ETF is red — skipping")
                         continue
 
-                    # Multi-timeframe confirmation
-                    if not is_confirmed_on_5min(symbol, high):
+                    # Multi-timeframe 5-min confirmation — only if enabled (default off)
+                    # Requiring BOTH 1-min AND 5-min breakout killed most
+                    # retail breakouts. Off by default restores trading.
+                    if FILTER_5MIN and not is_confirmed_on_5min(symbol, high):
                         log_skip(symbol, "Not confirmed on 5min chart")
                         no_trade_reason = "5min not confirmed"
                         continue
 
-                    # Time quality — skip weak late entries unless behind
-                    time_quality = get_time_quality_score()
-                    if time_quality < 0.5 and week_trade_count >= 1:
-                        log_skip(symbol, f"Low time quality ({time_quality})")
-                        continue
+                    # Time quality — only if enabled (default off)
+                    if FILTER_TIME_QUALITY:
+                        time_quality = get_time_quality_score()
+                        if time_quality < 0.5 and week_trade_count >= 1:
+                            log_skip(symbol, f"Low time quality ({time_quality})")
+                            continue
 
                     trade_qty      = get_position_qty(
                         current_price, equity, pos_mult
