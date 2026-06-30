@@ -35,9 +35,9 @@ TRAIL_DISTANCE   = 0.20  # was $0.30 — tighter trail
 MAX_WEEKLY_LOSS  = 4.50
 MAX_TRADES_PER_DAY  = 3   # max trades per day (no weekly PDT limit anymore)
 MAX_POSITIONS       = 3   # up to 3 concurrent positions (was 1)
-MIN_PRICE        = 10
-MAX_PRICE        = 25
-MAX_QTY          = 4      # hard cap — $25×4=$100 = 40% of $250
+MIN_PRICE        = 8      # was 10 — wider band so more agent picks survive
+MAX_PRICE        = 30     # was 25 — wider band so more agent picks survive
+MAX_QTY          = 4      # hard cap; per-trade cost also capped by sizing below
 BASE_QTY         = 2
 QTY_PER_50       = 2
 POSITION_PCT     = 0.35
