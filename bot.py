@@ -1892,8 +1892,7 @@ while True:
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
                             f"Trail: +${TRAIL_ACTIVATION} | "
                             f"Partial exit at TP\n"
-                            f"Today: {trades_today+1}/{MAX_TRADES_PER_DAY} | "
-                            f"Time quality: {time_quality:.0%}"
+                            f"Today: {trades_today+1}/{MAX_TRADES_PER_DAY}"
                         )
                     else:
                         reason = ("Bearish" if regime=="bearish"
