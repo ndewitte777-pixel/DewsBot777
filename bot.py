@@ -28,28 +28,28 @@ ALPACA_SECRET_KEY  = os.environ.get("ALPACA_SECRET_KEY")
 PUSHOVER_USER_KEY  = os.environ.get("PUSHOVER_USER_KEY")
 PUSHOVER_API_TOKEN = os.environ.get("PUSHOVER_API_TOKEN")
 
-TAKE_PROFIT      = 1.50
-STOP_LOSS        = 0.75
-TRAIL_ACTIVATION = 0.25  # was $0.50 — activates sooner to catch reversals
-TRAIL_DISTANCE   = 0.20  # was $0.30 — tighter trail
-MAX_WEEKLY_LOSS  = 4.50
-MAX_TRADES_PER_DAY  = 3   # max trades per day (no weekly PDT limit anymore)
-MAX_POSITIONS       = 3   # up to 3 concurrent positions (was 1)
-MIN_PRICE        = 8      # was 10 — wider band so more agent picks survive
-MAX_PRICE        = 30     # was 25 — wider band so more agent picks survive
-MAX_QTY          = 4      # hard cap; per-trade cost also capped by sizing below
+TAKE_PROFIT      = 2.50   # was 1.50 — bigger target so wins clear the spread
+STOP_LOSS        = 1.25   # was 0.75 — proportional to the bigger target (2:1 reward:risk)
+TRAIL_ACTIVATION = 0.60   # was 0.25 — don't trail until we have a real gain
+TRAIL_DISTANCE   = 0.35   # was 0.20 — wider trail so normal wiggle doesn't stop us out
+MAX_WEEKLY_LOSS  = 5.00
+MAX_TRADES_PER_DAY  = 2   # was 3 — fewer, higher-quality trades (less churn)
+MAX_POSITIONS       = 2   # was 3 — concentrate on best setups, less overtrading
+MIN_PRICE        = 8
+MAX_PRICE        = 30
+MAX_QTY          = 4
 BASE_QTY         = 2
 QTY_PER_50       = 2
 POSITION_PCT     = 0.35
-MIN_TP_PCT       = 0.004
-MIN_SL_PCT       = 0.005
+MIN_TP_PCT       = 0.015  # was 0.004 (0.4%) — now 1.5% min target, clears the spread
+MIN_SL_PCT       = 0.010  # was 0.005 — proportional floor on stop
 
 # Entry filters
 REGIME_THRESHOLD     = 0.001
-VOLUME_MULTIPLIER    = 1.1   # was 1.2 — slightly easier volume confirmation
+VOLUME_MULTIPLIER    = 1.3   # was 1.1 — require STRONGER volume (fewer, cleaner breakouts)
 ORB_BUFFER           = 0.001
-MIN_ORB_RANGE_PCT    = 0.003 # was 0.005 — allows tighter (marginal) setups to trade
-MIN_SPY_RANGE_PCT    = 0.0006 # was 0.001 — only skips genuinely DEAD market days
+MIN_ORB_RANGE_PCT    = 0.006 # was 0.003 — require a REAL breakout range, skip marginal chop
+MIN_SPY_RANGE_PCT    = 0.0006 # only skips genuinely DEAD market days
 SCANNER_RETRY_MINUTE = 50
 
 # Time filters
@@ -96,6 +96,15 @@ AGENT_PICKS_FILE = os.path.join(DATA_DIR, "agent_picks.csv")
 LOG_FILE          = os.path.join(DATA_DIR, "trade_log.csv")
 SKIP_LOG_FILE     = os.path.join(DATA_DIR, "skip_log.csv")
 MILESTONE_FILE    = os.path.join(DATA_DIR, "milestones.txt")
+SWEEP_FILE        = os.path.join(DATA_DIR, "sweep_log.csv")
+
+# ── INDEX FUND SWEEP REMINDER ──
+# The bot CANNOT move money between institutions (that's unsafe and not
+# possible via API). Instead it tracks how much profit is available above
+# your base capital and sends a weekly reminder to manually sweep it into
+# your index fund. You do the 30-second transfer; the bot does the math.
+SWEEP_BASE      = float(os.environ.get("SWEEP_BASE", "250"))   # capital floor to keep in Alpaca
+SWEEP_WEEKLY    = float(os.environ.get("SWEEP_WEEKLY", "10"))  # target weekly sweep amount
 os.makedirs(DATA_DIR, exist_ok=True)
 
 ET = pytz.timezone("America/New_York")
@@ -212,8 +221,71 @@ def check_milestones(equity):
         print(f"Milestone check failed: {e}")
 
 # =========================
-# TRADE LOGGER
+# INDEX FUND SWEEP TRACKER
+# Tracks profit available to move into your index fund, and reminds you
+# weekly. The bot does NOT move money — you do the transfer manually.
 # =========================
+
+def get_total_swept():
+    """Sum of all amounts you've marked as swept into the index fund."""
+    if not os.path.exists(SWEEP_FILE):
+        return 0.0
+    try:
+        total = 0.0
+        with open(SWEEP_FILE) as f:
+            for row in csv.DictReader(f):
+                total += float(row.get("amount", 0))
+        return total
+    except Exception:
+        return 0.0
+
+def log_sweep_reminder(equity, available):
+    """Records that a sweep reminder was sent (not that money moved)."""
+    try:
+        new_file = not os.path.exists(SWEEP_FILE)
+        with open(SWEEP_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["date", "type", "equity", "available", "amount", "note"])
+            w.writerow([
+                datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+                "reminder", round(equity, 2), round(available, 2), 0,
+                "reminder sent — sweep done manually by you"
+            ])
+    except Exception as e:
+        print(f"Sweep log failed: {e}")
+
+def send_sweep_reminder(equity):
+    """
+    Weekly reminder (Friday) showing how much is available to sweep into
+    the index fund. 'Available' = equity above your capital base, since
+    you only want to move PROFIT, not your working capital.
+    """
+    available = equity - SWEEP_BASE
+    if available < SWEEP_WEEKLY:
+        # Not enough profit above base to sweep the weekly target yet
+        notify(
+            f"💤 Sweep check — nothing to move yet\n"
+            f"Equity: ${equity:.2f} | Base kept working: ${SWEEP_BASE:.0f}\n"
+            f"Profit above base: ${max(0,available):.2f} "
+            f"(need ${SWEEP_WEEKLY:.0f}+ to sweep)"
+        )
+        return
+
+    # Enough profit exists — remind to move the weekly target
+    sweep_amt = min(available, SWEEP_WEEKLY) if SWEEP_WEEKLY > 0 else available
+    already   = get_total_swept()
+    notify(
+        f"💸 SWEEP REMINDER — move to your index fund\n"
+        f"Equity: ${equity:.2f} | Profit above ${SWEEP_BASE:.0f} base: "
+        f"${available:.2f}\n"
+        f"→ Move ${sweep_amt:.2f} to your index fund this week\n"
+        f"(Transfer it yourself — bank/brokerage app)\n"
+        f"Total swept so far: ${already:.2f}"
+    )
+    log_sweep_reminder(equity, available)
+
+
 
 def init_log():
     if not os.path.exists(LOG_FILE):
@@ -331,10 +403,9 @@ def get_streak_adjustments():
             break
 
     if consecutive_losses >= 2:
-        print(f"Losing streak ({consecutive_losses}) — tightening stops")
+        # (print removed — this ran every loop and spammed the log)
         return 0.75, 0.85   # tighter SL, smaller position
     elif consecutive_wins >= 2:
-        print(f"Winning streak ({consecutive_wins}) — slight size boost")
         return 1.0, 1.15    # normal SL, slightly larger position
     return 1.0, 1.0
 
@@ -533,6 +604,11 @@ def is_early_session():
 def is_monday_morning():
     now = datetime.now(ET)
     return now.weekday() == 0 and now.hour == 9 and now.minute < 31
+
+def is_friday_sweep_time():
+    """Friday 3:50 PM — after the trading day, remind to sweep profit."""
+    now = datetime.now(ET)
+    return now.weekday() == 4 and now.hour == 15 and now.minute == 50
 
 def is_market_close_time():
     now = datetime.now(ET)
@@ -1230,16 +1306,19 @@ def should_smart_exit(df, pos, current_price, entry_time):
     # Only skip profit-protection exits when losing
     vwap = get_vwap(df)
     # --- PROFIT PROTECTION exits (only when winning) ---
-    if gain > 0:
+    # Floors raised: don't take profit-protection exits on tiny gains that
+    # the bid/ask spread would eat. Only protect a MEANINGFUL gain ($0.50+).
+    MIN_MEANINGFUL_GAIN = 0.50 * qty  # must be up at least $0.50/share to bother
+    if gain > MIN_MEANINGFUL_GAIN:
         if is_volume_spike(df):
             return True, f"Volume spike — blow-off top +${gain:.2f}"
-        if current_price < vwap and gain > 0.10*qty:
+        if current_price < vwap and gain > MIN_MEANINGFUL_GAIN:
             return True, f"Below VWAP +${gain:.2f}"
-        if is_momentum_dying(df) and gain > pos["tp"]*0.20:
+        if is_momentum_dying(df) and gain > pos["tp"]*0.40:
             return True, f"Momentum dying +${gain:.2f}"
-        if is_volume_drying_up(df) and gain > 0.10*qty:
+        if is_volume_drying_up(df) and gain > MIN_MEANINGFUL_GAIN:
             return True, f"Volume drying up +${gain:.2f}"
-        if is_uptrend_broken(df) and gain > pos["tp"]*0.15:
+        if is_uptrend_broken(df) and gain > pos["tp"]*0.35:
             return True, f"Uptrend broken +${gain:.2f}"
 
     # --- LOSS LIMITING exits (fire even when losing) ---
@@ -1299,14 +1378,15 @@ def take_partial_profit(symbol, pos, current_price, regime):
     half_qty = max(1, pos["qty"]//2)
     exit_side = OrderSide.SELL if pos["side"]=="LONG" else OrderSide.BUY
 
-    place_order(symbol, exit_side, half_qty)
-    partial_pnl = ((current_price-pos["entry"])*half_qty
+    fill_price = place_order(symbol, exit_side, half_qty)
+    exit_price = fill_price if fill_price else current_price
+    partial_pnl = ((exit_price-pos["entry"])*half_qty
                    if pos["side"]=="LONG"
-                   else (pos["entry"]-current_price)*half_qty)
+                   else (pos["entry"]-exit_price)*half_qty)
 
     notify(
-        f"💰 PARTIAL EXIT {symbol} x{half_qty} @ ${current_price:.2f}\n"
-        f"+${partial_pnl:.2f} | Letting {pos['qty']-half_qty} shares run\n"
+        f"💰 PARTIAL EXIT {symbol} x{half_qty} @ ${exit_price:.2f}\n"
+        f"{partial_pnl:+.2f} (real fill) | Letting {pos['qty']-half_qty} shares run\n"
         f"Tight trail now active"
     )
 
@@ -1376,10 +1456,28 @@ def can_afford_trade(price, qty):
 # =========================
 
 def place_order(symbol, side, qty):
-    trading_client.submit_order(MarketOrderRequest(
+    """
+    Submits a market order and returns the actual average fill price,
+    so PnL is calculated from the REAL fill, not the theoretical quote.
+    Returns None if the fill price can't be determined (falls back to quote).
+    """
+    order = trading_client.submit_order(MarketOrderRequest(
         symbol=symbol, qty=qty, side=side,
         time_in_force=TimeInForce.DAY
     ))
+    # Poll briefly for the fill price (market orders fill fast)
+    for _ in range(10):
+        try:
+            filled = trading_client.get_order_by_id(order.id)
+            if filled.filled_avg_price:
+                return float(filled.filled_avg_price)
+            if str(filled.status) in ("OrderStatus.FILLED", "filled"):
+                if filled.filled_avg_price:
+                    return float(filled.filled_avg_price)
+        except Exception:
+            pass
+        time.sleep(1)
+    return None  # couldn't confirm fill price; caller uses quote as fallback
 
 # =========================
 # TRADE TARGETING
@@ -1412,6 +1510,7 @@ weekly_pnl       = _wpnl
 week_trade_count = _wtc
 trades_today     = _tt
 report_sent      = False
+sweep_sent       = False
 eod_sent         = False
 premarket_done   = False
 no_trade_reason  = ""
@@ -1442,6 +1541,7 @@ notify(
     f"{'5min ' if FILTER_5MIN else ''}"
     f"{'TimeQ ' if FILTER_TIME_QUALITY else ''}"
     f"{'(none — core only)' if not any([FILTER_NEWS,FILTER_SECTOR,FILTER_5MIN,FILTER_TIME_QUALITY]) else ''}\n"
+    f"💸 Sweep reminder: Fridays, profit above ${SWEEP_BASE:.0f} → your index fund\n"
     f"Trades this week: {week_trade_count} | P&L: ${weekly_pnl:.2f}"
 )
 
@@ -1460,6 +1560,7 @@ while True:
             weekly_pnl        = 0.0
             week_trade_count  = 0
             report_sent       = False
+            sweep_sent        = False
             partial_pnl_total = 0.0
             print("New week — reset")
         last_week = cur_week
@@ -1499,6 +1600,18 @@ while True:
         if is_monday_morning() and not report_sent:
             send_weekly_report(read_all_trades(), equity, qty)
             report_sent = True
+
+        # ── FRIDAY SWEEP REMINDER — 3:50 PM ──
+        # Reminds you to manually move profit into your index fund.
+        # The bot does NOT move money; it just does the math and nudges you.
+        if is_friday_sweep_time() and not sweep_sent:
+            try:
+                acct = trading_client.get_account()
+                cur_equity = float(acct.equity)
+            except Exception:
+                cur_equity = equity
+            send_sweep_reminder(cur_equity)
+            sweep_sent = True
 
         if not is_market_open():
             print(f"Market closed — "
@@ -1618,8 +1731,9 @@ while True:
                 try:
                     exit_side  = (OrderSide.SELL if pos["side"]=="LONG"
                                   else OrderSide.BUY)
-                    exit_price = get_data(sym)["close"].iloc[-1]
-                    place_order(sym, exit_side, pos["qty"])
+                    quote_price = get_data(sym)["close"].iloc[-1]
+                    fill_price = place_order(sym, exit_side, pos["qty"])
+                    exit_price = fill_price if fill_price else quote_price
                     pnl, _ = log_trade(
                         sym, pos["side"], pos["entry"],
                         exit_price, pos["qty"], regime, "EOD forced close",
@@ -1629,7 +1743,7 @@ while True:
                     week_trade_count += 1
                     trades_today     += 1
                     notify(
-                        f"EOD CLOSE {sym} | ${pnl:+.2f}\n"
+                        f"EOD CLOSE {sym} @ ${exit_price:.2f} | {pnl:+.2f} (real fill)\n"
                         f"Week P&L: ${weekly_pnl:.2f} | "
                         f"Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                     )
@@ -1721,18 +1835,19 @@ while True:
 
                     # 2. Full TP hit (after partial already taken)
                     elif gain >= pos["tp"] and pos.get("partial_taken"):
-                        place_order(symbol, exit_side, pos["qty"])
+                        fill_price = place_order(symbol, exit_side, pos["qty"])
+                        exit_price = fill_price if fill_price else current_price
                         pnl, _ = log_trade(
                             symbol, pos["side"], pos["entry"],
-                            current_price, pos["qty"], regime, "TP hit",
+                            exit_price, pos["qty"], regime, "TP hit",
                             source=("agent" if symbol in agent_symbols else "scanner")
                         )
                         weekly_pnl       += pnl
                         week_trade_count += 1
                         trades_today     += 1
                         notify(
-                            f"✅ TP HIT {symbol} @ ${current_price:.2f}\n"
-                            f"+${pnl:.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
+                            f"✅ TP HIT {symbol} @ ${exit_price:.2f}\n"
+                            f"{pnl:+.2f} (real fill) | Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
@@ -1740,10 +1855,11 @@ while True:
 
                     # 3. Trailing stop
                     elif is_trailing_stop_hit(pos, current_price):
-                        place_order(symbol, exit_side, pos["qty"])
+                        fill_price = place_order(symbol, exit_side, pos["qty"])
+                        exit_price = fill_price if fill_price else current_price
                         pnl, _ = log_trade(
                             symbol, pos["side"], pos["entry"],
-                            current_price, pos["qty"], regime,
+                            exit_price, pos["qty"], regime,
                             f"Trail stop ${pos['trail_price']:.2f}",
                             source=("agent" if symbol in agent_symbols else "scanner")
                         )
@@ -1751,8 +1867,8 @@ while True:
                         week_trade_count += 1
                         trades_today     += 1
                         notify(
-                            f"🔒 TRAIL STOP {symbol} @ ${current_price:.2f}\n"
-                            f"${pnl:+.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
+                            f"🔒 TRAIL STOP {symbol} @ ${exit_price:.2f}\n"
+                            f"{pnl:+.2f} (real fill) | Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                         )
                         del positions[symbol]
                         entry_times.pop(symbol, None)
@@ -1764,10 +1880,12 @@ while True:
                             df, pos, current_price, entry_time
                         )
                         if should_exit:
-                            place_order(symbol, exit_side, pos["qty"])
+                            fill_price = place_order(symbol, exit_side, pos["qty"])
+                            # Use the REAL fill price if we got it; else fall back
+                            exit_price = fill_price if fill_price else current_price
                             pnl, _ = log_trade(
                                 symbol, pos["side"], pos["entry"],
-                                current_price, pos["qty"],
+                                exit_price, pos["qty"],
                                 regime, exit_reason,
                                 source=("agent" if symbol in agent_symbols else "scanner")
                             )
@@ -1776,8 +1894,8 @@ while True:
                             trades_today     += 1
                             notify(
                                 f"🧠 SMART EXIT {symbol} "
-                                f"@ ${current_price:.2f}\n"
-                                f"${pnl:+.2f} | {exit_reason}\n"
+                                f"@ ${exit_price:.2f}\n"
+                                f"${pnl:+.2f} (real fill) | {exit_reason}\n"
                                 f"Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                             )
                             del positions[symbol]
@@ -1786,18 +1904,19 @@ while True:
 
                         # 5. Hard stop loss
                         elif gain <= -pos["sl"]:
-                            place_order(symbol, exit_side, pos["qty"])
+                            fill_price = place_order(symbol, exit_side, pos["qty"])
+                            exit_price = fill_price if fill_price else current_price
                             pnl, _ = log_trade(
                                 symbol, pos["side"], pos["entry"],
-                                current_price, pos["qty"], regime, "SL hit",
+                                exit_price, pos["qty"], regime, "SL hit",
                                 source=("agent" if symbol in agent_symbols else "scanner")
                             )
                             weekly_pnl       += pnl
                             week_trade_count += 1
                             trades_today     += 1
                             notify(
-                                f"🛑 SL HIT {symbol} @ ${current_price:.2f}\n"
-                                f"${pnl:.2f} | Week: {trades_today}/{MAX_TRADES_PER_DAY}"
+                                f"🛑 SL HIT {symbol} @ ${exit_price:.2f}\n"
+                                f"{pnl:.2f} (real fill) | Today: {trades_today}/{MAX_TRADES_PER_DAY}"
                             )
                             del positions[symbol]
                             entry_times.pop(symbol, None)
@@ -1869,14 +1988,16 @@ while True:
                             log_skip(symbol, f"Insufficient buying power")
                             continue
                         pending_orders.add(symbol)
-                        place_order(symbol, OrderSide.BUY, trade_qty)
+                        entry_fill = place_order(symbol, OrderSide.BUY, trade_qty)
+                        # Use the REAL entry fill so all future PnL is accurate
+                        actual_entry = entry_fill if entry_fill else current_price
                         positions[symbol] = {
                             "side":        "LONG",
-                            "entry":       current_price,
+                            "entry":       actual_entry,
                             "tp":          tp_amt,
                             "sl":          sl_amt,
                             "qty":         trade_qty,
-                            "peak_price":  current_price,
+                            "peak_price":  actual_entry,
                             "partial_taken": False,
                         }
                         entry_times[symbol] = now_et
@@ -1888,7 +2009,7 @@ while True:
                         gap_tag = " 🌅GAP" if symbol in premarket_gaps else ""
                         notify(
                             f"📈 BUY {symbol} x{trade_qty} "
-                            f"@ ${current_price:.2f}{gap_tag}\n"
+                            f"@ ${actual_entry:.2f}{gap_tag} (real fill)\n"
                             f"TP: +${tp_amt:.2f} | SL: -${sl_amt:.2f}\n"
                             f"Trail: +${TRAIL_ACTIVATION} | "
                             f"Partial exit at TP\n"
