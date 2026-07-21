@@ -33,16 +33,16 @@ STOP_LOSS        = 1.25   # was 0.75 — proportional to the bigger target (2:1 
 TRAIL_ACTIVATION = 0.60   # was 0.25 — don't trail until we have a real gain
 TRAIL_DISTANCE   = 0.35   # was 0.20 — wider trail so normal wiggle doesn't stop us out
 MAX_WEEKLY_LOSS  = 5.00
-MAX_TRADES_PER_DAY  = 2   # was 3 — fewer, higher-quality trades (less churn)
-MAX_POSITIONS       = 2   # was 3 — concentrate on best setups, less overtrading
+MAX_TRADES_PER_DAY  = 2   # fewer, higher-quality trades (less churn)
+MAX_POSITIONS       = 2   # up to 2 concurrent positions
 MIN_PRICE        = 8
 MAX_PRICE        = 30
-MAX_QTY          = 4
+MAX_QTY          = 12     # raised so ~40% target isn't capped on cheaper stocks
 BASE_QTY         = 2
 QTY_PER_50       = 2
-POSITION_PCT     = 0.35
-MIN_TP_PCT       = 0.015  # was 0.004 (0.4%) — now 1.5% min target, clears the spread
-MIN_SL_PCT       = 0.010  # was 0.005 — proportional floor on stop
+POSITION_PCT     = 0.80   # ÷ MAX_POSITIONS(2) = ~40% per trade
+MIN_TP_PCT       = 0.015  # 1.5% min target, clears the spread
+MIN_SL_PCT       = 0.010  # proportional floor on stop
 
 # Entry filters
 REGIME_THRESHOLD     = 0.001
