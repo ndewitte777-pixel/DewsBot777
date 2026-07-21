@@ -35,12 +35,14 @@ TRAIL_DISTANCE   = 0.35   # was 0.20 — wider trail so normal wiggle doesn't st
 MAX_WEEKLY_LOSS  = 5.00
 MAX_TRADES_PER_DAY  = 2   # fewer, higher-quality trades (less churn)
 MAX_POSITIONS       = 2   # up to 2 concurrent positions
-MIN_PRICE        = 8
+MIN_PRICE        = 5      # was 8 — allows cheaper stocks (more shares, same $ risk)
 MAX_PRICE        = 30
-MAX_QTY          = 12     # raised so ~40% target isn't capped on cheaper stocks
+MAX_QTY          = 20     # raised so cheap ($5-8) stocks aren't share-capped
 BASE_QTY         = 2
 QTY_PER_50       = 2
-POSITION_PCT     = 0.80   # ÷ MAX_POSITIONS(2) = ~40% per trade
+# Sizing: ~30% of the account per trade — a reasonable level that still
+# survives losing streaks. Scales automatically as the account grows.
+POSITION_PCT     = 0.60   # ÷ MAX_POSITIONS(2) = ~30% per trade
 MIN_TP_PCT       = 0.015  # 1.5% min target, clears the spread
 MIN_SL_PCT       = 0.010  # proportional floor on stop
 
@@ -126,7 +128,7 @@ SECTOR_ETFS = {
     "ConsumerStap": "XLP",
 }
 
-# Verified $10-$25 range June 2026
+# Price band set by MIN_PRICE / MAX_PRICE
 SECTOR_STOCKS = {
     "Technology":   ["SOFI", "SNAP", "INTC"],
     "Energy":       ["OXY", "SLB", "DVN", "HAL", "CVX"],
@@ -820,7 +822,7 @@ def get_top_sectors():
 # ============================================================
 # This calls your "Daily Stock Profit Scout" managed agent to get
 # a ranked list of tickers. The bot then filters those to its
-# $10-$25 range and trades them, tagging each as an agent pick.
+# price-filtered range and trades them, tagging each as an agent pick.
 #
 # >>> THE ONE FUNCTION YOU MUST VERIFY: call_profit_scout_agent() <<<
 # Managed Agents use a SESSION-based REST API (create session -> stream
@@ -838,7 +840,7 @@ import re as _re
 # add minutes to composition. The bot only needs the final TICKERS line.
 AGENT_OUTPUT_INSTRUCTION = (
     "Screen today's market for the best intraday LONG breakout candidates "
-    "priced $10-$25 with high liquidity and a clear momentum/catalyst edge. "
+    "priced $5-$30 with high liquidity and a clear momentum/catalyst edge. "
     "Keep your written analysis BRIEF — one short sentence per pick maximum "
     "(ticker, price, the catalyst). Do NOT write long essays; be concise to "
     "save time. "
@@ -1048,7 +1050,7 @@ def log_agent_picks(call_label, raw_tickers, kept_tickers):
 
 def get_agent_watchlist(call_label):
     """
-    Full agent flow: call agent -> parse tickers -> filter to $10-$25
+    Full agent flow: call agent -> parse tickers -> filter to price band
     using a live snapshot.
     Returns (status, picks):
       status "ok"     -> picks is the list (may be empty if NONE/all filtered)
@@ -1067,7 +1069,7 @@ def get_agent_watchlist(call_label):
 
     print(f"Agent ({call_label}) raw picks: {tickers}")
 
-    # Filter to $10-$25 range using a live snapshot
+    # Filter to MIN_PRICE-MAX_PRICE range using a live snapshot
     kept = []
     try:
         req   = StockSnapshotRequest(symbol_or_symbols=tickers)
@@ -1405,8 +1407,8 @@ def take_partial_profit(symbol, pos, current_price, regime):
 # =========================
 
 def get_position_qty(price, equity, pos_multiplier=1.0):
-    # Divide capital across max concurrent positions so they all fit.
-    # 35% / 3 positions = ~11.6% each, leaving buffer.
+    # Risk a fixed % of the LIVE account per trade (scales as account grows).
+    # POSITION_PCT(0.50) / MAX_POSITIONS(2) = ~25% per trade.
     per_position_pct = POSITION_PCT / MAX_POSITIONS
     risk      = equity * per_position_pct * pos_multiplier
     qty       = max(1, int(risk/price))
